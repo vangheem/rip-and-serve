@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.elevenlabs.key
+.tavily.key
+admin-password
+*.log
+.DS_Store

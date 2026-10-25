@@ -1,0 +1,58 @@
+#!/bin/bash
+# Start the rip status page. Safe to run twice. Used by cron at boot.
+set -euo pipefail
+if [[ -z "${HOME:-}" || "$HOME" == / ]]; then
+  HOME="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  export HOME
+fi
+PORT=8790
+APP="$HOME/rip-status/rip-status.py"
+STATE="$HOME/.local/share/rip-status"
+LOG="$STATE/rip-status.log"
+PIDFILE="$STATE/rip-status.pid"
+mkdir -p "$STATE"
+
+listening() {
+  ss -ltnH | awk '{print $4}' | grep -Eq "(^|:)$1$"
+}
+
+stop_owned() {
+  local pid cmd
+  if [[ -f "$PIDFILE" ]]; then
+    pid=$(cat "$PIDFILE" || true)
+    if [[ -n "${pid}" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PIDFILE"
+  fi
+  local pids
+  pids=$(ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u || true)
+  for pid in $pids; do
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    case "$cmd" in
+      *rip-status.py*) kill "$pid" 2>/dev/null || true ;;
+    esac
+  done
+}
+
+if [[ "${1:-}" == "--restart" ]]; then
+  stop_owned
+  sleep 0.4
+fi
+
+if listening "$PORT"; then
+  echo "rip-status already up on :$PORT"
+  exit 0
+fi
+
+setsid /usr/bin/python3 "$APP" --port "$PORT" >>"$LOG" 2>&1 </dev/null &
+echo $! >"$PIDFILE"
+for _ in $(seq 1 25); do
+  if listening "$PORT"; then
+    echo "rip-status up on :$PORT"
+    exit 0
+  fi
+  sleep 0.2
+done
+echo "rip-status did not open :$PORT" >&2
+exit 1

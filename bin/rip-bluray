@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# Rip the main Blu-ray title, then write one MP4 to the Movies library.
+# Use --profile to pick a speed/quality tradeoff, and --sample to test it.
+set -euo pipefail
+
+MOUNT=/mnt/videos
+DEST_ROOT="${RIP_DEST:-/mnt/data/videos/Movies}"
+WORK_ROOT="${RIP_WORK:-/mnt/data/rip-work}"
+DEVICE="${RIP_DEVICE:-/dev/sr0}"
+PROFILE="${RIP_PROFILE:-balanced}"
+CACHE=512
+SCAN_TIMEOUT=300
+
+usage() {
+  cat <<USAGE
+Usage: rip-bluray [--scan] [--profile NAME] [--sample SECONDS]
+                  [--mkv FILE] [--title N] [--dest DIR] [--work DIR]
+                  [--keep-work] [--profiles]
+
+Rips the longest title on $DEVICE and writes one MP4 to $DEST_ROOT.
+Intermediate files stay in $WORK_ROOT.
+
+  --profile NAME  fast, balanced, hd, or max (default: balanced)
+  --profiles      list profiles and exit
+  --sample N      encode N seconds only, for comparison; not saved as the movie
+  --mkv FILE      encode an existing MKV instead of reading the disc
+  --scan          show the disc and output path; do not rip
+  --title N       rip a specific title instead of the longest one
+  --dest DIR      output directory (default: /mnt/data/videos/Movies)
+  --work DIR      scratch directory (default: /mnt/data/rip-work)
+  --keep-work     leave the intermediate MKV after a successful encode
+USAGE
+}
+
+list_profiles() {
+  cat <<EOF
+fast       720p, x264 fast, RF 21, stereo. Smallest and quickest.
+balanced   720p, x264 slow, RF 19, surround. Best quality for the time. Default.
+hd         1080p, x264 slow, RF 20, surround. Keeps full resolution.
+max        1080p, x264 veryslow, RF 18, surround. Largest and slowest.
+EOF
+}
+
+profile_preset() {
+  case "$1" in
+    fast) printf '%s\n' "Fast 720p30" ;;
+    balanced) printf '%s\n' "HQ 720p30 Surround" ;;
+    hd) printf '%s\n' "HQ 1080p30 Surround" ;;
+    max) printf '%s\n' "Super HQ 1080p30 Surround" ;;
+    *) return 1 ;;
+  esac
+}
+
+scan=0
+keep_work=0
+list_only=0
+title_arg=""
+mkv_arg=""
+sample=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --scan) scan=1; shift ;;
+    --keep-work) keep_work=1; shift ;;
+    --profiles) list_only=1; shift ;;
+    --profile)
+      [[ $# -ge 2 ]] || { echo "error: --profile needs a name" >&2; exit 2; }
+      PROFILE="$2"
+      shift 2
+      ;;
+    --sample)
+      [[ $# -ge 2 ]] || { echo "error: --sample needs a number of seconds" >&2; exit 2; }
+      sample="$2"
+      shift 2
+      ;;
+    --mkv)
+      [[ $# -ge 2 ]] || { echo "error: --mkv needs a file" >&2; exit 2; }
+      mkv_arg="$2"
+      shift 2
+      ;;
+    --title)
+      [[ $# -ge 2 ]] || { echo "error: --title needs a number" >&2; exit 2; }
+      title_arg="$2"
+      shift 2
+      ;;
+    --dest)
+      [[ $# -ge 2 ]] || { echo "error: --dest needs a directory" >&2; exit 2; }
+      DEST_ROOT="$2"
+      shift 2
+      ;;
+    --work)
+      [[ $# -ge 2 ]] || { echo "error: --work needs a directory" >&2; exit 2; }
+      WORK_ROOT="$2"
+      shift 2
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [[ "$list_only" -eq 1 ]]; then
+  list_profiles
+  exit 0
+fi
+
+die() { echo "error: $*" >&2; exit 1; }
+
+preset=$(profile_preset "$PROFILE") || {
+  echo "error: unknown profile: $PROFILE" >&2
+  list_profiles >&2
+  exit 2
+}
+if [[ -n "$sample" ]] && ! [[ "$sample" =~ ^[0-9]+$ ]]; then
+  die "--sample must be a number of seconds"
+fi
+
+command -v HandBrakeCLI >/dev/null || die "HandBrakeCLI is not installed"
+
+encode_mkv() {
+  local src="$1" dest="$2"
+  local -a extra=()
+  if [[ -n "$sample" ]]; then
+    # Start past the logos. stop-at duration is seconds to encode.
+    extra+=(--start-at duration:600 --stop-at "duration:${sample}")
+  else
+    extra+=(
+      --native-language eng
+      --subtitle scan
+      --subtitle-forced
+      --subtitle-burned=native
+    )
+  fi
+  echo "profile: $PROFILE ($preset)"
+  echo "encoding $src"
+  echo "output: $dest"
+  HandBrakeCLI \
+    --preset "$preset" \
+    --input "$src" \
+    --output "$dest" \
+    --format av_mp4 \
+    --optimize \
+    --markers \
+    "${extra[@]}"
+  [[ -s "$dest" ]] || die "HandBrake did not produce an MP4"
+}
+
+if [[ -n "$mkv_arg" ]]; then
+  [[ -f "$mkv_arg" ]] || die "MKV not found: $mkv_arg"
+  mkdir -p "$DEST_ROOT"
+  [[ -w "$DEST_ROOT" ]] || die "$DEST_ROOT is not writable"
+  stem=$(basename "$mkv_arg" .mkv)
+  stem=$(printf '%s\n' "$stem" | sed -E 's/_t[0-9]+$//')
+  if [[ -n "$sample" ]]; then
+    final="${DEST_ROOT%/}/${stem}.${PROFILE}.${sample}s.mp4"
+  else
+    final="${DEST_ROOT%/}/${stem}.mp4"
+  fi
+  if [[ -e "$final" ]]; then
+    die "output already exists: $final"
+  fi
+  encode_mkv "$mkv_arg" "$final"
+  echo "done: $final"
+  exit 0
+fi
+
+[[ -b "$DEVICE" ]] || die "optical drive $DEVICE is not present"
+command -v makemkvcon >/dev/null || die "makemkvcon is not installed"
+
+mkdir -p "$DEST_ROOT"
+[[ -w "$DEST_ROOT" ]] || die "$DEST_ROOT is not writable"
+mkdir -p "$WORK_ROOT"
+[[ -w "$WORK_ROOT" ]] || die "$WORK_ROOT is not writable"
+
+info=$(mktemp)
+choice=$(mktemp)
+trap 'rm -f "$info" "$choice"' EXIT
+
+echo "reading disc on $DEVICE..."
+opened=0
+for attempt in 1 2; do
+  if ! timeout "$SCAN_TIMEOUT" makemkvcon -r --cache=128 info "dev:$DEVICE" >"$info"; then
+    die "MakeMKV could not read the disc within ${SCAN_TIMEOUT}s"
+  fi
+  if grep -q "^CINFO:2," "$info" || grep -q "^CINFO:30," "$info"; then
+    opened=1
+    break
+  fi
+  if [[ "$attempt" -eq 1 ]]; then
+    echo "disc not ready, closing tray and retrying..."
+    eject -t "$DEVICE" || true
+    sleep 8
+  fi
+done
+if [[ "$opened" -eq 0 ]]; then
+  if grep -q "Failed to open disc" "$info"; then
+    die "MakeMKV could not open the disc. Close the tray and try again."
+  fi
+  die "no disc name; is a disc inserted?"
+fi
+
+python3 - "$info" "$title_arg" "$DEST_ROOT" "$WORK_ROOT" "$scan" "$choice" "$PROFILE" "$sample" << 'PARSE'
+import re, sys
+info_path, title_arg, dest_root, work_root, scan, choice_path, profile, sample = sys.argv[1:]
+scan = scan == "1"
+lines = open(info_path, encoding="utf-8", errors="replace").read().splitlines()
+
+def field(line):
+    m = re.match(r"^[A-Z]+:(?:\d+,)+\d+,(.*)$", line)
+    if not m:
+        return ""
+    val = m.group(1).strip()
+    if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+        val = val[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return val
+
+disc = ""
+titles = {}
+for line in lines:
+    if line.startswith("CINFO:"):
+        m = re.match(r"CINFO:(\d+),", line)
+        if m and m.group(1) in {"2", "30"} and not disc:
+            disc = field(line)
+    elif line.startswith("TINFO:"):
+        m = re.match(r"TINFO:(\d+),(\d+),", line)
+        if not m:
+            continue
+        titles.setdefault(int(m.group(1)), {})[int(m.group(2))] = field(line)
+
+if not disc:
+    if any("Failed to open disc" in line for line in lines):
+        raise SystemExit("error: MakeMKV could not open the disc. Close the tray and try again.")
+    raise SystemExit("error: no disc name; is a disc inserted?")
+
+def seconds(value):
+    parts = value.split(":")
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + int(float(parts[1]))
+    return int(float(value))
+
+if title_arg:
+    if not title_arg.isdigit() or int(title_arg) not in titles:
+        raise SystemExit(f"error: title {title_arg} was not found")
+    title_id = int(title_arg)
+else:
+    title_id = None
+    best_sec = -1
+    for tid, attrs in titles.items():
+        raw = attrs.get(9, "")
+        if not raw:
+            continue
+        try:
+            sec = seconds(raw)
+        except ValueError:
+            continue
+        if sec > best_sec:
+            best_sec = sec
+            title_id = tid
+    if title_id is None:
+        raise SystemExit("error: no titles found on disc")
+
+safe = disc.replace("\u2019", "'").replace("\u2018", "'").replace("\u201c", '"').replace("\u201d", '"')
+safe = re.sub(r'[\\/:*?"<>|]+', " ", safe)
+safe = re.sub(r"\s+", " ", safe).strip(" .") or "bluray"
+work = work_root.rstrip("/") + "/" + safe
+if sample:
+    final = work + "/samples/" + safe + "." + profile + "." + sample + "s.mp4"
+else:
+    final = dest_root.rstrip("/") + "/" + safe + ".mp4"
+attrs = titles.get(title_id, {})
+print(f"disc: {disc}")
+print(f"title: {title_id} ({attrs.get(9, '?')})")
+print(f"profile: {profile}")
+print(f"work: {work}")
+print(f"output: {final}")
+if not scan:
+    open(choice_path, "w", encoding="utf-8").write(f"{title_id}\n{work}\n{final}\n")
+PARSE
+
+if [[ "$scan" -eq 1 ]]; then
+  exit 0
+fi
+
+title_id=$(sed -n '1p' "$choice")
+work=$(sed -n '2p' "$choice")
+final=$(sed -n '3p' "$choice")
+[[ -n "$title_id" && -n "$work" && -n "$final" ]] || die "failed to choose a title"
+if [[ -e "$final" ]]; then
+  die "output already exists: $final"
+fi
+
+avail_work=$(df -B1 --output=avail "$WORK_ROOT" | tail -1)
+if (( avail_work < 50 * 1024 * 1024 * 1024 )); then
+  die "need at least 50GB free in $WORK_ROOT (have $((avail_work / 1024 / 1024 / 1024))GB)"
+fi
+if [[ -z "$sample" ]]; then
+  avail_dest=$(df -B1 --output=avail "$DEST_ROOT" | tail -1)
+  if (( avail_dest < 8 * 1024 * 1024 * 1024 )); then
+    die "need at least 8GB free in $DEST_ROOT"
+  fi
+fi
+
+rm -rf "$work"
+mkdir -p "$work"
+echo "ripping title $title_id to $work"
+makemkvcon --progress=-stdout --cache="$CACHE" mkv "dev:$DEVICE" "$title_id" "$work"
+
+mkv=$(find "$work" -type f -name '*.mkv' -printf '%s\t%p\n' | sort -nr | head -1 | cut -f2-)
+[[ -n "$mkv" ]] || die "MakeMKV did not produce an MKV in $work"
+mkdir -p "$(dirname "$final")"
+encode_mkv "$mkv" "$final"
+echo "done: $final"
+if [[ "$keep_work" -eq 0 && -z "$sample" ]]; then
+  rm -rf "$work"
+  echo "removed work files"
+fi

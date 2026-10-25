@@ -1,0 +1,17 @@
+[Unit]
+Description=Automatic disc encoder
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+User=@RIP_USER@
+Group=@RIP_USER@
+ExecStart=/usr/local/bin/rip-bluray-encoder
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# Watch the optical drive, rip the longest title, then eject the disc.
+set -euo pipefail
+
+ROLE=ripper
+# shellcheck disable=SC1091
+source /usr/local/lib/rip-bluray/common.sh
+load_config
+LOG="$LOG_DIR/ripper.log"
+EMPTY_SINCE=""
+
+finish_job() {
+  stop_heartbeat
+  release_lock ripper
+}
+
+trap finish_job EXIT
+
+recover_ripping_jobs() {
+  local job status
+  shopt -s nullglob
+  for job in "$JOBS"/*; do
+    [[ -f "$job/status" ]] || continue
+    status="$(cat "$job/status")"
+    if [[ "$status" == "ripping" ]] && ! ps -C makemkvcon -o stat= | grep -vq Z; then
+      log "marking abandoned rip failed: $(basename "$job")"
+      printf '%s\n' failed > "$job/status"
+      printf '%s\n' "ripper restarted before the rip finished" > "$job/error"
+    fi
+  done
+}
+
+read_disc() {
+  local info="$1"
+  local attempt
+  for attempt in 1 2; do
+    if ! timeout "$SCAN_TIMEOUT" makemkvcon -r --cache=128 info "dev:$DEVICE" >"$info"; then
+      log "MakeMKV info timed out"
+      return 1
+    fi
+    if grep -q "^CINFO:2," "$info" || grep -q "^CINFO:30," "$info"; then
+      return 0
+    fi
+    if [[ "$attempt" -eq 1 ]]; then
+      log "disc not ready, closing tray"
+      eject -t "$DEVICE" || true
+      sleep 8
+    fi
+  done
+  return 1
+}
+
+run_with_progress_timeout() {
+  local watch_dir="$1"
+  shift
+  local child now last_change size log_size progress
+  "$@" >"$watch_dir/rip.log" 2>&1 &
+  child=$!
+  last_change="$(date +%s)"
+  while kill -0 "$child" 2>/dev/null; do
+    date +%s > "$(lock_dir ripper)/heartbeat"
+    size="$(find "$watch_dir" -type f -name '*.mkv' -printf '%s\n' 2>/dev/null | sort -nr | head -1 || true)"
+    log_size="$(wc -c < "$watch_dir/rip.log" 2>/dev/null || echo 0)"
+    progress="${size:-0}:${log_size:-0}"
+    now="$(date +%s)"
+    if [[ "${progress}" != "${LAST_PROGRESS:-}" ]]; then
+      LAST_PROGRESS="$progress"
+      last_change="$now"
+    fi
+    if (( now - last_change > LOCK_TIMEOUT )); then
+      log "rip stalled for ${LOCK_TIMEOUT}s, stopping it"
+      kill "$child" 2>/dev/null || true
+      sleep 2
+      kill -9 "$child" 2>/dev/null || true
+      wait "$child" 2>/dev/null || true
+      return 1
+    fi
+    sleep 20
+  done
+  wait "$child"
+}
+
+eject_disc() {
+  local name="$1"
+  eject -r "$DEVICE" || eject -s "$DEVICE" || true
+  sleep 3
+  if drive_has_medium; then
+    log "eject did not release $name"
+    write_status idle "$name is done, but the disc is still in the drive"
+    return 1
+  fi
+  log "ejected $name"
+  write_status idle "ejected $name; waiting for the next disc"
+}
+
+rip_current_disc() {
+  local info choice title_id disc_name disc_id duration
+  local stamp slug job output mkv
+  info="$(mktemp)"
+  choice="$(mktemp)"
+  if ! read_disc "$info"; then
+    log "MakeMKV could not open the disc"
+    rm -f "$info" "$choice"
+    return 1
+  fi
+  if ! python3 /usr/local/lib/rip-bluray/choose-title.py "$info" >"$choice"; then
+    log "could not choose a title"
+    rm -f "$info" "$choice"
+    return 1
+  fi
+  title_id="$(sed -n '1p' "$choice")"
+  disc_name="$(sed -n '2p' "$choice")"
+  disc_id="$(sed -n '3p' "$choice")"
+  duration="$(sed -n '4p' "$choice")"
+  rm -f "$info" "$choice"
+
+  if [[ -f "$STATE_DIR/hold-disc-id" && "$(cat "$STATE_DIR/hold-disc-id")" == "$disc_id" ]]; then
+    write_status idle "$disc_name is done; remove the disc when you want the next one"
+    return 0
+  fi
+
+  output="$DEST_ROOT/$disc_name.mp4"
+  if [[ -s "$output" ]]; then
+    log "$disc_name already exists at $output; ejecting without a new rip"
+    printf '%s\n' "$disc_id" > "$STATE_DIR/hold-disc-id"
+    eject_disc "$disc_name"
+    return 0
+  fi
+
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  slug="$(printf '%s' "$disc_name" | tr -c 'A-Za-z0-9._-' '-')"
+  job="$JOBS/${stamp}-${slug}"
+  mkdir -p "$job"
+  printf '%s\n' ripping > "$job/status"
+  printf '%s\n' "$disc_name" > "$job/disc-name"
+  printf '%s\n' "$disc_id" > "$job/disc-id"
+  printf '%s\n' "$title_id" > "$job/title-id"
+  printf '%s\n' "$PROFILE" > "$job/profile"
+  printf '%s\n' "$output" > "$job/output"
+  log "ripping $disc_name title $title_id ($duration) to $job"
+  write_status ripping "ripping $disc_name" "$job"
+
+  LAST_PROGRESS=""
+  if ! run_with_progress_timeout "$job" \
+    makemkvcon --progress=-stdout --cache="$CACHE" mkv "dev:$DEVICE" "$title_id" "$job"; then
+    printf '%s\n' failed > "$job/status"
+    printf '%s\n' "MakeMKV failed or stalled" > "$job/error"
+    log "rip failed for $disc_name; disc left in the drive"
+    write_status failed "rip failed for $disc_name" "$job"
+    return 1
+  fi
+  # makemkvcon writes its own log redirection only if we wrap it.
+  # run_with_progress_timeout does not redirect, so send output in the wrapper.
+  mkv="$(find "$job" -type f -name '*.mkv' -printf '%s\t%p\n' | sort -nr | head -1 | cut -f2- || true)"
+  if [[ -z "$mkv" ]]; then
+    printf '%s\n' failed > "$job/status"
+    printf '%s\n' "MakeMKV produced no MKV" > "$job/error"
+    log "rip produced no MKV for $disc_name"
+    write_status failed "no MKV for $disc_name" "$job"
+    return 1
+  fi
+  printf '%s\n' "$mkv" > "$job/mkv"
+  printf '%s\n' ripped > "$job/status"
+  printf '%s\n' "$disc_id" > "$STATE_DIR/hold-disc-id"
+  log "rip complete: $mkv"
+  eject_disc "$disc_name"
+}
+
+note_drive_empty() {
+  local now
+  now="$(date +%s)"
+  if [[ -z "$EMPTY_SINCE" ]]; then
+    EMPTY_SINCE="$now"
+  elif (( now - EMPTY_SINCE > 60 )); then
+    rm -f "$STATE_DIR/hold-disc-id"
+  fi
+  write_status idle "waiting for a disc"
+}
+
+main() {
+  log "ripper started pid=$$"
+  while true; do
+    if ! acquire_lock ripper; then
+      write_status busy "ripper lock is held"
+      sleep "$POLL_SECONDS"
+      continue
+    fi
+    start_heartbeat ripper
+    recover_ripping_jobs
+    label="$(lsblk -dn -o LABEL "$DEVICE" 2>/dev/null || true)"
+    hold="$(cat "$STATE_DIR/hold-disc-id" 2>/dev/null || true)"
+    if drive_has_medium && [[ -n "$hold" && "$label" == "$hold" ]]; then
+      EMPTY_SINCE=""
+      write_status idle "$label is done; remove the disc when you want the next one"
+    elif drive_has_medium; then
+      EMPTY_SINCE=""
+      rip_current_disc || sleep 60
+    else
+      note_drive_empty
+    fi
+    stop_heartbeat
+    release_lock ripper
+    sleep "$POLL_SECONDS"
+  done
+}
+
+main

@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# Encode ripped discs to MP4. Independent of the optical drive.
+set -euo pipefail
+
+ROLE=encoder
+# shellcheck disable=SC1091
+source /usr/local/lib/rip-bluray/common.sh
+load_config
+LOG="$LOG_DIR/encoder.log"
+
+finish_job() {
+  stop_heartbeat
+  release_lock encoder
+}
+
+trap finish_job EXIT
+
+recover_encoding_jobs() {
+  local job
+  shopt -s nullglob
+  if ps -C HandBrakeCLI -o stat= | grep -vq Z; then
+    return 0
+  fi
+  for job in "$JOBS"/*; do
+    [[ -f "$job/status" ]] || continue
+    if [[ "$(cat "$job/status")" == "encoding" ]]; then
+      log "returning abandoned encode to the queue: $(basename "$job")"
+      printf '%s\n' ripped > "$job/status"
+    fi
+  done
+}
+
+next_job() {
+  local job
+  shopt -s nullglob
+  for job in "$JOBS"/*; do
+    [[ -f "$job/status" ]] || continue
+    if [[ "$(cat "$job/status")" == "ripped" ]]; then
+      printf '%s\n' "$job"
+      return 0
+    fi
+  done
+  return 1
+}
+
+run_with_progress_timeout() {
+  local watch_file="$1"
+  local log_file="$2"
+  shift 2
+  local child now last_change size log_size progress
+  "$@" >"$log_file" 2>&1 &
+  child=$!
+  last_change="$(date +%s)"
+  LAST_PROGRESS=""
+  while kill -0 "$child" 2>/dev/null; do
+    date +%s > "$(lock_dir encoder)/heartbeat"
+    size="$(wc -c < "$watch_file" 2>/dev/null || echo 0)"
+    log_size="$(wc -c < "$log_file" 2>/dev/null || echo 0)"
+    progress="${size:-0}:${log_size:-0}"
+    now="$(date +%s)"
+    if [[ "$progress" != "$LAST_PROGRESS" ]]; then
+      LAST_PROGRESS="$progress"
+      last_change="$now"
+    fi
+    if (( now - last_change > LOCK_TIMEOUT )); then
+      log "encode stalled for ${LOCK_TIMEOUT}s, stopping it"
+      kill "$child" 2>/dev/null || true
+      sleep 2
+      kill -9 "$child" 2>/dev/null || true
+      wait "$child" 2>/dev/null || true
+      return 1
+    fi
+    sleep 20
+  done
+  wait "$child"
+}
+
+encode_job() {
+  local job="$1"
+  local mkv profile preset disc_name output partial
+  mkv="$(cat "$job/mkv")"
+  profile="$(cat "$job/profile")"
+  disc_name="$(cat "$job/disc-name")"
+  output="$(cat "$job/output")"
+  preset="$(profile_preset "$profile")" || {
+    printf '%s\n' failed > "$job/status"
+    printf '%s\n' "unknown profile $profile" > "$job/error"
+    log "unknown profile $profile for $job"
+    return 1
+  }
+  if [[ ! -s "$mkv" ]]; then
+    printf '%s\n' failed > "$job/status"
+    printf '%s\n' "MKV missing: $mkv" > "$job/error"
+    log "MKV missing for $disc_name"
+    return 1
+  fi
+  if [[ -s "$output" ]]; then
+    printf '%s\n' failed > "$job/status"
+    printf '%s\n' "output already exists: $output" > "$job/error"
+    log "not overwriting $output"
+    return 1
+  fi
+  printf '%s\n' encoding > "$job/status"
+  partial="$job/encode.mp4"
+  rm -f "$partial"
+  log "encoding $disc_name with $profile ($preset)"
+  write_status encoding "encoding $disc_name" "$job"
+  if ! run_with_progress_timeout "$partial" "$job/encode.log" \
+    HandBrakeCLI \
+    --preset "$preset" \
+    --input "$mkv" \
+    --output "$partial" \
+    --format av_mp4 \
+    --optimize \
+    --markers \
+    --native-language eng \
+    --subtitle scan \
+    --subtitle-forced \
+    --subtitle-burned=native; then
+    printf '%s\n' failed > "$job/status"
+    printf '%s\n' "HandBrake failed or stalled" > "$job/error"
+    log "encode failed for $disc_name"
+    write_status failed "encode failed for $disc_name" "$job"
+    return 1
+  fi
+  if [[ ! -s "$partial" ]]; then
+    printf '%s\n' failed > "$job/status"
+    printf '%s\n' "HandBrake produced an empty MP4" > "$job/error"
+    log "empty MP4 for $disc_name"
+    write_status failed "empty MP4 for $disc_name" "$job"
+    return 1
+  fi
+  mv -n "$partial" "$output"
+  printf '%s\n' done > "$job/status"
+  rm -f "$mkv"
+  log "done: $output"
+  write_status idle "finished $disc_name" "$job"
+}
+
+main() {
+  log "encoder started pid=$$"
+  while true; do
+    if ! acquire_lock encoder; then
+      write_status busy "encoder lock is held"
+      sleep "$POLL_SECONDS"
+      continue
+    fi
+    start_heartbeat encoder
+    recover_encoding_jobs
+    if job="$(next_job)"; then
+      encode_job "$job" || true
+    else
+      write_status idle "waiting for a ripped disc"
+    fi
+    stop_heartbeat
+    release_lock encoder
+    sleep "$POLL_SECONDS"
+  done
+}
+
+main

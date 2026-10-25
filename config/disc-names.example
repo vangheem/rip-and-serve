@@ -1,0 +1,14 @@
+# Names for discs whose own label is useless.
+# The ripper reads the live copy on every scan:
+#   $WORK_ROOT/state/disc-names
+#
+# fingerprint <id> = File name
+# duration <label> <H:MM:SS> = File name
+# series <label> = Series name
+#
+# A series line names later discs "Series - Disc 3", "Series - Disc 4", ...
+# A fingerprint or duration line wins over that.
+
+# fingerprint 0123456789ab = Example Series - Disc 2
+# duration LABEL 1:32:00 = Example Movie
+# series LABEL = Example Series

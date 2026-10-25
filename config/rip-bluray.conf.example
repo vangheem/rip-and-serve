@@ -1,0 +1,10 @@
+# Automatic disc pipeline. The services read this file when they start.
+PROFILE=hd
+DEVICE=/dev/sr0
+DEST_ROOT=/mnt/data/videos/Movies
+WORK_ROOT=/mnt/data/rip-work
+# A lock older than this, with a dead or silent process, can be taken over.
+LOCK_TIMEOUT=1200
+POLL_SECONDS=15
+CACHE=512
+SCAN_TIMEOUT=300

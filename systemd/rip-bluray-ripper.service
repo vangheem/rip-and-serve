@@ -1,0 +1,19 @@
+[Unit]
+Description=Automatic disc ripper
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+User=@RIP_USER@
+Group=@RIP_USER@
+SupplementaryGroups=cdrom
+ExecStartPre=+/bin/sh -c 'echo 0 > /proc/sys/dev/cdrom/autoclose'
+ExecStart=/usr/local/bin/rip-bluray-ripper
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
