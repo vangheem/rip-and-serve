@@ -40,7 +40,7 @@ load_dest() {
 install_libs() {
   mkdir -p "$LIB_DIR"
   local name
-  for name in common.sh choose-title.py identify-title.py title_card.py; do
+  for name in common.sh choose-title.py identify-title.py title_card.py copy-disc.py; do
     link_file "$ROOT/lib/$name" "$LIB_DIR/$name"
   done
   chmod +x "$ROOT"/lib/*.py "$ROOT"/tools/*.py
@@ -162,6 +162,20 @@ install_jellyfin() {
   docker compose -f "$live" up -d
 }
 
+ensure_skip_read_errors() {
+  local conf="$HOME_DIR/.MakeMKV/settings.conf"
+  mkdir -p "$HOME_DIR/.MakeMKV"
+  touch "$conf"
+  if ! grep -q '^io_IgnoreReadErrors' "$conf"; then
+    printf '%s\n' 'io_IgnoreReadErrors = "1"' >>"$conf"
+    log "MakeMKV will skip an unreadable stretch instead of stopping"
+  fi
+  if ! grep -q '^io_ErrorRetryCount' "$conf"; then
+    printf '%s\n' 'io_ErrorRetryCount = "2"' >>"$conf"
+    log "MakeMKV will retry a bad spot twice, then move on"
+  fi
+}
+
 install_titles() {
   local state="$WORK_ROOT/state/imdb"
   mkdir -p "$state"
@@ -227,6 +241,7 @@ reload_idle_ripper() {
 main() {
   load_dest
   install_libs
+  ensure_skip_read_errors
   install_bins
   install_conf
   load_dest

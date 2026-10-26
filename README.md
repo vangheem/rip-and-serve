@@ -37,6 +37,8 @@ Copy `config/rip-bluray.conf.example` to `/etc/rip-bluray.conf` if that file doe
 
 ## Naming
 
+A scratched disc is not a failed movie. MakeMKV is told to skip an unreadable stretch and keep going. If the drive still gives up, the disc is copied with zeros in the bad spots and the rip is finished from that copy. The file will glitch for a moment where the scratch is.
+
 A title printed on screen is tried first. Frames from the start of the file and the end credits are read with Tesseract and matched against the local IMDb list.
 
 If that finds nothing, and `~/.elevenlabs.key` and `~/.tavily.key` exist, two short dialogue clips are transcribed and searched. Those key files are not part of this repo.

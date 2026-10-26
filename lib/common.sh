@@ -169,6 +169,50 @@ HandBrakeCLI() {
   command HandBrakeCLI "$@" --encoder x264 --encoder-preset slow --quality "$quality"
 }
 
+
+# The ripper calls makemkvcon by name. A scratch should not end the movie.
+makemkvcon() {
+  local cmd="" source="" title="" dest="" i next
+  for ((i=1; i<=$#; i++)); do
+    if [[ "${!i}" == "mkv" ]]; then
+      cmd=mkv
+      next=$((i + 1))
+      source="${!next}"
+      next=$((i + 2))
+      title="${!next}"
+      next=$((i + 3))
+      dest="${!next}"
+    fi
+  done
+  if [[ "$cmd" != "mkv" || "$source" != dev:* ]]; then
+    command makemkvcon "$@"
+    return
+  fi
+  if command makemkvcon "$@"; then
+    return 0
+  fi
+  local status=$?
+  local device="${source#dev:}" image args=() arg replaced=0
+  image="$dest/disc-skip.iso"
+  printf "%s\n" "unreadable spot on $device; copying around it and continuing"
+  if ! python3 "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/copy-disc.py" "$device" "$image"; then
+    return "$status"
+  fi
+  for arg in "$@"; do
+    if [[ "$replaced" == 0 && "$arg" == "$source" ]]; then
+      args+=("iso:$image")
+      replaced=1
+    else
+      args+=("$arg")
+    fi
+  done
+  if command makemkvcon "${args[@]}"; then
+    rm -f "$image"
+    return 0
+  fi
+  return "$status"
+}
+
 record_finished_quality() {
   local output="$1" tag
   tag="$(cat "$STATE_DIR/last-encode-tag" 2>/dev/null || true)"
