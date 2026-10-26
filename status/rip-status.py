@@ -133,13 +133,24 @@ def unit_info(unit):
     return info
 
 
+def optical_device():
+    """A scratched disc can knock the drive off USB. It comes back as another device."""
+    if os.path.exists(DEVICE):
+        return DEVICE
+    import glob
+
+    found = sorted(glob.glob("/dev/sr*"))
+    return found[0] if found else DEVICE
+
+
 def drive_status():
     status = "MISSING"
-    if os.path.exists(DEVICE):
+    device = optical_device()
+    if os.path.exists(device):
         try:
             import fcntl
 
-            fd = os.open(DEVICE, os.O_RDONLY | os.O_NONBLOCK)
+            fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
             try:
                 code = fcntl.ioctl(fd, 0x5326, 0)
             finally:
@@ -149,7 +160,7 @@ def drive_status():
             status = "NO_INFO"
     label = ""
     size = ""
-    code, out, _ = run(["lsblk", "-dn", "-o", "LABEL,SIZE", DEVICE])
+    code, out, _ = run(["lsblk", "-dn", "-o", "LABEL,SIZE", device])
     if code == 0 and out.strip():
         parts = out.split()
         if len(parts) >= 2 and not parts[0].endswith("G") and not parts[0].endswith("M"):
@@ -233,11 +244,28 @@ def interesting_lines(path):
 
 
 def progress_of(path):
-    text = read_text(path, 16_384).replace("\r", "\n")
+    text = read_text(path, 200_000).replace("\r", "\n")
     percent = None
     detail = ""
+    copy_total = None
     for line in text.splitlines():
         clean = " ".join(line.split())
+        match = re.search(r"copying \S+ \((\d+) bytes\)", clean)
+        if match:
+            copy_total = int(match.group(1))
+            continue
+        match = re.search(r"copied (\d+) bytes(?:, skipped (\d+))?", clean)
+        if match:
+            copied = int(match.group(1))
+            skipped = int(match.group(2) or 0)
+            if copy_total:
+                percent = min(99, int(copied * 100 / copy_total))
+            detail = f"copying around the scratch, {human_size(copied)}"
+            if copy_total:
+                detail += f" of {human_size(copy_total)}"
+            if skipped:
+                detail += f", skipped {human_size(skipped)}"
+            continue
         match = re.search(r"Total progress -\s*(\d+)%", clean)
         if match:
             percent = int(match.group(1))
@@ -259,27 +287,40 @@ def progress_of(path):
 
 
 def largest_media(directory):
-    best = None
-    best_size = -1
+    movie = None
+    movie_size = -1
+    movie_mtime = None
+    image = None
+    image_size = -1
+    image_mtime = None
     try:
         names = os.listdir(directory)
     except OSError:
         return None, None, None
     for name in names:
-        if not name.endswith((".mkv", ".mp4")):
+        # The movie file does not exist yet while a scratch is being copied around.
+        if not name.endswith((".mkv", ".mp4", ".iso")):
             continue
         path = directory / name
         try:
             stat = path.stat()
         except OSError:
             continue
-        if stat.st_size > best_size:
-            best = path
-            best_size = stat.st_size
-            best_mtime = stat.st_mtime
-    if best is None:
-        return None, None, None
-    return best.name, best_size, best_mtime
+        if name.endswith(".iso"):
+            if stat.st_size > image_size:
+                image = path
+                image_size = stat.st_size
+                image_mtime = stat.st_mtime
+            continue
+        if stat.st_size > movie_size:
+            movie = path
+            movie_size = stat.st_size
+            movie_mtime = stat.st_mtime
+    if movie is not None:
+        return movie.name, movie_size, movie_mtime
+    if image is not None:
+        return image.name, image_size, image_mtime
+    return None, None, None
 
 
 def vague(text):
