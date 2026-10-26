@@ -7,6 +7,8 @@ import json
 import os
 import re
 import subprocess
+import threading
+import time
 import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -75,9 +77,17 @@ def run(args, timeout=5):
     return result.returncode, result.stdout, result.stderr
 
 
-def read_text(path, limit=200_000):
+def read_text(path, limit=200_000, head=False):
+    """Read the tail, not the whole file. Encode logs are several megabytes."""
     try:
-        data = Path(path).read_bytes()[-limit:]
+        with open(path, "rb") as handle:
+            if head:
+                data = handle.read(limit)
+            else:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - limit))
+                data = handle.read(limit)
     except OSError:
         return ""
     return data.decode("utf-8", "replace")
@@ -143,7 +153,31 @@ def optical_device():
     return found[0] if found else DEVICE
 
 
-def drive_status():
+_cache_lock = threading.Lock()
+_drive_cache = {"at": 0.0, "value": None, "probing": False}
+_page_cache = {"collect": None, "collect_at": 0.0, "failed": None, "failed_at": 0.0}
+_collect_lock = threading.Lock()
+_failed_lock = threading.Lock()
+DRIVE_TTL = 20
+PAGE_TTL = 5
+
+
+def drive_label_size(device):
+    label = ""
+    size = ""
+    code, out, _ = run(["lsblk", "-dn", "-o", "LABEL,SIZE", device], timeout=1)
+    if code == 0 and out.strip():
+        parts = out.split()
+        if len(parts) >= 2 and not parts[0].endswith("G") and not parts[0].endswith("M"):
+            label = parts[0]
+            size = parts[-1]
+        elif parts:
+            size = parts[-1]
+    return label, size
+
+
+def probe_drive():
+    """Ask the drive itself. This blocks for seconds while a rip is reading."""
     status = "MISSING"
     device = optical_device()
     if os.path.exists(device):
@@ -158,22 +192,108 @@ def drive_status():
             status = DRIVE_NAMES.get(code, "NO_INFO")
         except OSError:
             status = "NO_INFO"
-    label = ""
-    size = ""
-    code, out, _ = run(["lsblk", "-dn", "-o", "LABEL,SIZE", device])
-    if code == 0 and out.strip():
-        parts = out.split()
-        if len(parts) >= 2 and not parts[0].endswith("G") and not parts[0].endswith("M"):
-            label = parts[0]
-            size = parts[-1]
-        elif parts:
-            size = parts[-1]
+    label, size = drive_label_size(device)
     return {
         "status": status,
         "text": DRIVE_TEXT.get(status, status),
         "label": label,
         "size": size,
     }
+
+
+def _probe_drive_later():
+    try:
+        value = probe_drive()
+    except Exception:
+        value = None
+    with _cache_lock:
+        _drive_cache["probing"] = False
+        if value is not None:
+            _drive_cache["value"] = value
+            _drive_cache["at"] = time.monotonic()
+
+
+def drive_from_rip(ripper):
+    """A rip already means a disc is in the drive. Do not ask the drive."""
+    label = ""
+    job = ripper.get("job") or ""
+    if job:
+        label = read_text(Path(job) / "disc-name").strip()
+    _, size = drive_label_size(optical_device())
+    cached = _drive_cache["value"] or {}
+    return {
+        "status": "DISC_OK",
+        "text": DRIVE_TEXT["DISC_OK"],
+        "label": label or cached.get("label") or "",
+        "size": size or cached.get("size") or "",
+    }
+
+
+def drive_status():
+    ripper = parse_status_file("ripper")
+    if ripper.get("state") == "ripping":
+        return drive_from_rip(ripper)
+    now = time.monotonic()
+    with _cache_lock:
+        cached = _drive_cache["value"]
+        fresh = cached is not None and now - _drive_cache["at"] < DRIVE_TTL
+        if fresh:
+            return cached
+        if not _drive_cache["probing"]:
+            _drive_cache["probing"] = True
+            threading.Thread(target=_probe_drive_later, daemon=True).start()
+    if cached is not None:
+        return cached
+    deadline = time.monotonic() + 0.3
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        with _cache_lock:
+            if _drive_cache["value"] is not None:
+                return _drive_cache["value"]
+    return {
+        "status": "NO_INFO",
+        "text": "checking the drive",
+        "label": "",
+        "size": "",
+    }
+
+
+def cached_collect():
+    now = time.monotonic()
+    with _cache_lock:
+        cached = _page_cache["collect"]
+        if cached is not None and now - _page_cache["collect_at"] < PAGE_TTL:
+            return cached
+    with _collect_lock:
+        now = time.monotonic()
+        with _cache_lock:
+            cached = _page_cache["collect"]
+            if cached is not None and now - _page_cache["collect_at"] < PAGE_TTL:
+                return cached
+        data = collect()
+        with _cache_lock:
+            _page_cache["collect"] = data
+            _page_cache["collect_at"] = time.monotonic()
+        return data
+
+
+def cached_failed():
+    now = time.monotonic()
+    with _cache_lock:
+        cached = _page_cache["failed"]
+        if cached is not None and now - _page_cache["failed_at"] < PAGE_TTL:
+            return cached
+    with _failed_lock:
+        now = time.monotonic()
+        with _cache_lock:
+            cached = _page_cache["failed"]
+            if cached is not None and now - _page_cache["failed_at"] < PAGE_TTL:
+                return cached
+        data = failed_review()
+        with _cache_lock:
+            _page_cache["failed"] = data
+            _page_cache["failed_at"] = time.monotonic()
+        return data
 
 
 def disk_usage():
@@ -245,6 +365,9 @@ def interesting_lines(path):
 
 def progress_of(path):
     text = read_text(path, 200_000).replace("\r", "\n")
+    # The disc size is printed once, at the start. A long log must not lose it.
+    if "copied " in text and " bytes)" not in text:
+        text = read_text(path, 4096, head=True).replace("\r", "\n") + "\n" + text
     percent = None
     detail = ""
     copy_total = None
@@ -1038,16 +1161,16 @@ class Handler(BaseHTTPRequestHandler):
             body = b"ok\n"
             kind = "text/plain; charset=utf-8"
         elif path == "/api/status":
-            body = json.dumps(collect(), default=str).encode()
+            body = json.dumps(cached_collect(), default=str).encode()
             kind = "application/json; charset=utf-8"
         elif path in {"/", "/index.html"}:
-            body = render(collect()).encode()
+            body = render(cached_collect()).encode()
             kind = "text/html; charset=utf-8"
         elif path == "/failed":
-            body = render_failed(failed_review()).encode()
+            body = render_failed(cached_failed()).encode()
             kind = "text/html; charset=utf-8"
         elif path == "/api/failed":
-            body = json.dumps(failed_review(), default=str).encode()
+            body = json.dumps(cached_failed(), default=str).encode()
             kind = "application/json; charset=utf-8"
         else:
             self.send_error(404)
