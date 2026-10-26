@@ -22,6 +22,16 @@ load_config() {
   STATUS_DIR="$WORK_ROOT/status"
   STATE_DIR="$WORK_ROOT/state"
   mkdir -p "$JOBS" "$LOCKS" "$LOG_DIR" "$STATUS_DIR" "$STATE_DIR" "$DEST_ROOT"
+  # A scratched disc can knock the drive off USB. It comes back as another device.
+  if [[ ! -b "${DEVICE:-}" ]]; then
+    local candidate
+    for candidate in /dev/sr1 /dev/sr2 /dev/sr3 /dev/sr0; do
+      if [[ -b "$candidate" ]]; then
+        DEVICE="$candidate"
+        break
+      fi
+    done
+  fi
 }
 
 log() {
@@ -188,15 +198,21 @@ makemkvcon() {
     command makemkvcon "$@"
     return
   fi
-  if command makemkvcon "$@"; then
-    return 0
+  # MakeMKV exits 0 even when it saved nothing. A missing file is a failure.
+  if [[ ! -f "${STATE_DIR:-}/skip-bad-sectors" ]]; then
+    command makemkvcon "$@" || true
+    if [[ -d "$dest" ]] && find "$dest" -type f -name '*.mkv' -size +1M | grep -q .; then
+      return 0
+    fi
+  else
+    rm -f "${STATE_DIR:-}/skip-bad-sectors"
+    printf '%s\n' "this disc scratched last time; copying around the bad part first"
   fi
-  local status=$?
   local device="${source#dev:}" image args=() arg replaced=0
   image="$dest/disc-skip.iso"
-  printf "%s\n" "unreadable spot on $device; copying around it and continuing"
+  printf '%s\n' "unreadable spot on $device; copying around it and continuing"
   if ! python3 "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/copy-disc.py" "$device" "$image"; then
-    return "$status"
+    return 1
   fi
   for arg in "$@"; do
     if [[ "$replaced" == 0 && "$arg" == "$source" ]]; then
@@ -206,11 +222,12 @@ makemkvcon() {
       args+=("$arg")
     fi
   done
-  if command makemkvcon "${args[@]}"; then
+  command makemkvcon "${args[@]}" || true
+  if [[ -d "$dest" ]] && find "$dest" -type f -name '*.mkv' -size +1M | grep -q .; then
     rm -f "$image"
     return 0
   fi
-  return "$status"
+  return 1
 }
 
 record_finished_quality() {
