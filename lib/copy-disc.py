@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Copy a disc, writing zeros where the drive cannot read.
+"""Copy a disc, repeating the last good piece where the drive cannot read.
 
 A bad sector used to be retried one 2 KB block at a time, and the drive can
 sit for 30 seconds on each one. A scratch should cost a moment of the movie,
-not hours. On a failed read, skip a megabyte and keep going.
+not hours. On a failed read, skip a megabyte and fill it with the last good
+piece, so the movie still opens.
 
 An existing image is continued, not started over.
 """
@@ -16,8 +17,9 @@ import sys
 import time
 
 SECTOR = 2048
-CHUNK = 512 * 1024
-SKIP = 1024 * 1024
+UNIT = 6144
+CHUNK = 85 * UNIT
+SKIP = 170 * UNIT
 READ_TIMEOUT_MS = 5000
 SKIP_LIMIT = 2 * 1024 * 1024 * 1024
 SG_IO = 0x2285
@@ -108,6 +110,27 @@ def write_zeros(out, count):
         piece = min(count, len(ZEROS))
         out.write(ZEROS[:piece])
         count -= piece
+
+
+def last_good_unit(offset, data, previous):
+    end = offset + len(data)
+    unit_end = end - (end % UNIT)
+    unit_start = unit_end - UNIT
+    if unit_start < offset or unit_end > end:
+        return previous
+    return data[unit_start - offset:unit_end - offset]
+
+
+def write_fill(out, count, unit):
+    """A hole of zeros will not decrypt. Repeat the last good piece instead."""
+    if not unit:
+        write_zeros(out, count)
+        return
+    left = count
+    while left:
+        piece = unit if left >= UNIT else unit[:left]
+        out.write(piece)
+        left -= len(piece)
 
 
 class Reader:
@@ -230,13 +253,15 @@ def copy(src, dest):
     offset = 0
     if os.path.exists(dest):
         offset = os.path.getsize(dest)
-        offset -= offset % SECTOR
+        offset -= offset % UNIT
     out = open(dest, "r+b" if offset else "wb")
     if offset:
+        out.truncate(offset)
         out.seek(offset)
     reader = Reader(device)
     total = disc_size(reader.fd)
     skipped = 0
+    last_unit = None
     reported = time.time()
     print(f"copying {device} ({total} bytes) to {dest}", flush=True)
     if offset:
@@ -246,7 +271,7 @@ def copy(src, dest):
             size = CHUNK
             if total:
                 size = min(size, total - offset)
-                size -= size % SECTOR
+                size -= size % UNIT
             if size <= 0:
                 break
             try:
@@ -258,10 +283,10 @@ def copy(src, dest):
                 jump = SKIP
                 if total:
                     jump = min(jump, total - offset)
-                jump -= jump % SECTOR
+                jump -= jump % UNIT
                 if jump <= 0:
                     break
-                write_zeros(out, jump)
+                write_fill(out, jump, last_unit)
                 print(f"skipped {jump} bytes at {offset}", flush=True)
                 skipped += jump
                 offset += jump
@@ -269,6 +294,7 @@ def copy(src, dest):
                     print(f"too much unreadable data ({skipped} bytes)", flush=True)
                     return 2
                 continue
+            last_unit = last_good_unit(offset, data, last_unit)
             out.write(data)
             offset += len(data)
             now = time.time()
