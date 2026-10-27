@@ -6,6 +6,7 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -687,7 +688,8 @@ def collect():
             )
     drive = drive_status()
     ripper = services["ripper"]
-    if drive["status"] == "DISC_OK" and ripper["state"] in {"idle", "failed", "unknown"}:
+    drop_false_ignored()
+    if seated_long_enough(drive, ripper, now):
         record_ignored_disc(drive, ripper, now)
         attention.insert(
             0,
@@ -797,27 +799,61 @@ def dest_root():
     return "/mnt/data/videos/Movies"
 
 
+def seated_long_enough(drive, ripper, now, seconds=180):
+    """A new disc needs time to spin up. Do not call that a failure."""
+    path = WORK / "state" / "seated-since"
+    if drive.get("status") != "DISC_OK" or ripper.get("state") not in {"idle", "failed", "unknown"}:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return False
+    label = (drive.get("label") or "").strip() or "unlabeled disc"
+    lines = read_text(path).splitlines()
+    since = parse_time(lines[1]) if len(lines) >= 2 and lines[0] == label else None
+    if since is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(label + "\n" + now.isoformat() + "\n")
+        return False
+    return (now - since).total_seconds() >= seconds
+
+
+def drop_false_ignored():
+    """A volume label logged as ignored is not a failure if that disc then ripped."""
+    if not JOBS.is_dir():
+        return
+    later = {}
+    for directory in JOBS.iterdir():
+        if not directory.is_dir() or (directory / "ignored").is_file():
+            continue
+        status = read_text(directory / "status").strip()
+        if status not in {"ripping", "ripped", "encoding", "done"}:
+            continue
+        disc_id = read_text(directory / "disc-id").strip()
+        if disc_id and directory.name > later.get(disc_id, ""):
+            later[disc_id] = directory.name
+    for directory in list(JOBS.iterdir()):
+        if not (directory / "ignored").is_file():
+            continue
+        disc_id = read_text(directory / "disc-id").strip()
+        if disc_id and later.get(disc_id, "") > directory.name:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
 def record_ignored_disc(drive, ripper, now):
     """Keep a failed job when a seated disc never gets a rip.
 
     The ripper does not create a job if MakeMKV cannot open the disc, so the
     failed page would otherwise forget it as soon as the disc is removed.
+    A disc that was just inserted is not that case. The ripper needs a few
+    minutes, and an old "could not open" line belongs to the previous disc.
     """
-    if drive.get("status") != "DISC_OK":
-        return None
-    if ripper.get("state") not in {"idle", "failed", "unknown"}:
+    if not seated_long_enough(drive, ripper, now):
         return None
     label = (drive.get("label") or "").strip() or "unlabeled disc"
     if not JOBS.is_dir():
         return None
     logs = recent_logs("ripper", 40)
-    saw_open_failure = any(
-        "could not open" in line or "info timed out" in line for line in logs
-    )
-    idle_since = parse_time(ripper.get("updated") or "")
-    idle_long = idle_since is not None and (now - idle_since).total_seconds() >= 120
-    if not saw_open_failure and not idle_long:
-        return None
     newest = None
     for directory in JOBS.iterdir():
         if not directory.is_dir() or read_text(directory / "disc-name").strip() != label:
@@ -873,6 +909,7 @@ def same_disc(failed, other):
 
 def failed_review():
     now = datetime.now(timezone.utc)
+    drop_false_ignored()
     record_ignored_disc(drive_status(), parse_status_file("ripper"), now)
     jobs = all_jobs(now)
     successes = [job for job in jobs if retry_succeeded(job)]
