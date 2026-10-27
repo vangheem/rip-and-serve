@@ -541,6 +541,25 @@ def job_total_time(directory, status, output, now):
     return label
 
 
+
+def repair_in_progress(directory):
+    needle = str(directory).encode()
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return False
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            cmd = open(f"/proc/{name}/cmdline", "rb").read()
+        except OSError:
+            continue
+        if b"makemkvcon" in cmd and needle in cmd:
+            return True
+    return False
+
+
 def job_record(directory, now):
     name = read_text(directory / "disc-name").strip() or directory.name
     status = read_text(directory / "status").strip() or "unknown"
@@ -560,6 +579,15 @@ def job_record(directory, now):
     encode_percent, encode_detail = progress_of(directory / "encode.log")
     if encode_percent is not None:
         percent, progress_detail = encode_percent, encode_detail
+    for repair_log in sorted(directory.glob("makemkv-retry*.log")):
+        repair_percent, repair_detail = progress_of(repair_log)
+        if repair_percent is not None:
+            percent, progress_detail = repair_percent, repair_detail
+    if repair_in_progress(directory):
+        status = "ripping"
+        error = ""
+        if not progress_detail:
+            progress_detail = "repairing the disc copy"
     media_name, media_size, media_mtime = largest_media(directory)
     output_size = None
     if output and os.path.isfile(output):
@@ -1107,6 +1135,8 @@ def render(data):
         reason = job["error"] or job["reason"]
         if job["status"] == "failed":
             reason = job["reason"] or job["error"]
+        elif job.get("progress_detail"):
+            reason = job["progress_detail"]
         size = ""
         if job["output_size"]:
             size = human_size(job["output_size"])
