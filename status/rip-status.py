@@ -229,7 +229,22 @@ def drive_from_rip(ripper):
     }
 
 
+def copy_running():
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            cmd = open(f"/proc/{name}/cmdline", "rb").read()
+        except OSError:
+            continue
+        if b"/copy-disc.py" in cmd:
+            return True
+    return False
+
+
 def drive_status():
+    if copy_running():
+        return drive_from_rip(parse_status_file("ripper"))
     ripper = parse_status_file("ripper")
     if ripper.get("state") == "ripping":
         return drive_from_rip(ripper)

@@ -115,6 +115,13 @@ write_status() {
   local state="$1"
   local message="$2"
   local job="${3:-}"
+  # A scratch copy owns the drive. Do not report the disc done, and do not
+  # let a status rewrite look like the rip stopped.
+  if [[ -f "$STATE_DIR/scratch-copy" ]] && pgrep -f '/lib/copy-disc.py' >/dev/null 2>&1; then
+    state=ripping
+    message="copying around the scratch"
+    job="$(cat "$STATE_DIR/scratch-copy")"
+  fi
   cat > "$STATUS_DIR/$ROLE" <<EOF
 state=$state
 job=$job
@@ -396,6 +403,10 @@ medium_reject_reason() {
 
 drive_has_medium() {
   local status reason
+  # Asking a busy drive if a disc is in it blocks for seconds and stalls the copy.
+  if pgrep -f '/lib/copy-disc.py' >/dev/null 2>&1; then
+    return 0
+  fi
   status="$(cdrom_drive_status)"
   if [[ "$status" == "DISC_OK" || "$status" == "NO_DISC" ]]; then
     rm -f "$STATE_DIR/note-tray-open"

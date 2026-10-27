@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Copy a disc, writing zeros where the drive cannot read.
 
-A scratch should cost a moment of the movie, not the rest of the file.
-If the drive falls off the USB bus, wait for it to come back and continue.
+A bad sector used to be retried one 2 KB block at a time, and the drive can
+sit for 30 seconds on each one. A scratch should cost a moment of the movie,
+not hours. On a failed read, skip a megabyte and keep going.
+
+An existing image is continued, not started over.
 """
 
+import ctypes
 import errno
 import glob
 import os
@@ -12,41 +16,61 @@ import sys
 import time
 
 SECTOR = 2048
-BIG = 1024 * 1024
-SKIP_LIMIT = 200 * 1024 * 1024
+CHUNK = 512 * 1024
+SKIP = 1024 * 1024
+READ_TIMEOUT_MS = 5000
+SKIP_LIMIT = 2 * 1024 * 1024 * 1024
+SG_IO = 0x2285
+SG_DXFER_FROM_DEV = -3
+ZEROS = b"\0" * SKIP
+
+
+class SgIoHdr(ctypes.Structure):
+    _fields_ = [
+        ("interface_id", ctypes.c_int),
+        ("dxfer_direction", ctypes.c_int),
+        ("cmd_len", ctypes.c_ubyte),
+        ("mx_sb_len", ctypes.c_ubyte),
+        ("iovec_count", ctypes.c_ushort),
+        ("dxfer_len", ctypes.c_uint),
+        ("dxferp", ctypes.c_void_p),
+        ("cmdp", ctypes.c_void_p),
+        ("sbp", ctypes.c_void_p),
+        ("timeout", ctypes.c_uint),
+        ("flags", ctypes.c_uint),
+        ("pack_id", ctypes.c_int),
+        ("usr_ptr", ctypes.c_void_p),
+        ("status", ctypes.c_ubyte),
+        ("masked_status", ctypes.c_ubyte),
+        ("msg_status", ctypes.c_ubyte),
+        ("sb_len_wr", ctypes.c_ubyte),
+        ("host_status", ctypes.c_ushort),
+        ("driver_status", ctypes.c_ushort),
+        ("resid", ctypes.c_int),
+        ("duration", ctypes.c_uint),
+        ("info", ctypes.c_uint),
+    ]
+
+
+assert ctypes.sizeof(SgIoHdr) == 88
 
 
 def disc_size(fd):
     try:
         import fcntl
         import struct
+
         raw = fcntl.ioctl(fd, 0x80081272, b"\0" * 8)
         return struct.unpack("Q", raw)[0]
     except OSError:
         return 0
 
 
-def drive_ready(path):
-    try:
-        import fcntl
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    except OSError:
-        return False
-    try:
-        return fcntl.ioctl(fd, 0x5326, 0) == 4
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
-
-
 def find_drive(preferred):
-    if preferred and drive_ready(preferred):
+    if preferred and os.path.exists(preferred):
         return preferred
-    for path in sorted(glob.glob("/dev/sr*")):
-        if drive_ready(path):
-            return path
-    return ""
+    found = sorted(glob.glob("/dev/sr*"))
+    return found[0] if found else ""
 
 
 def hide_hash_tables(path):
@@ -79,98 +103,185 @@ def hide_hash_tables(path):
     return 0
 
 
-def copy(src, dest):
-    out = open(dest, "wb")
-    offset = 0
-    skipped = 0
-    reported = time.time()
-    device = find_drive(src) or src
-    fd = os.open(device, os.O_RDONLY)
-    total = disc_size(fd)
-    print(f"copying {device} ({total} bytes) to {dest}", flush=True)
+def write_zeros(out, count):
+    while count:
+        piece = min(count, len(ZEROS))
+        out.write(ZEROS[:piece])
+        count -= piece
 
-    def reopen(at):
-        nonlocal fd, device
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        fd = None
+
+class Reader:
+    def __init__(self, path):
+        self.path = path
+        self.fd = None
+        self.use_sg = os.environ.get("COPY_DISC_NO_SG") != "1"
+        self.fast_fails = 0
+        self._buf = ctypes.create_string_buffer(CHUNK)
+        self._cdb = (ctypes.c_ubyte * 10)()
+        self._sense = ctypes.create_string_buffer(64)
+        self.open()
+
+    def open(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        self.fd = os.open(self.path, os.O_RDONLY)
+
+    def reopen(self, preferred):
         deadline = time.time() + 180
         while time.time() < deadline:
-            time.sleep(3)
-            device = find_drive(src) or find_drive("")
+            time.sleep(2)
+            device = find_drive(preferred) or find_drive("")
             if not device:
                 continue
+            self.path = device
             try:
-                fd = os.open(device, os.O_RDONLY)
-                os.lseek(fd, at, os.SEEK_SET)
-                print(f"drive came back as {device} at {at}", flush=True)
-                return
+                self.open()
             except OSError:
                 continue
+            print(f"drive came back as {device}", flush=True)
+            return
         raise OSError(errno.ENODEV, "drive did not come back")
 
-    def skip_sector(at):
-        nonlocal offset, skipped
-        out.write(b"\0" * SECTOR)
-        skipped += SECTOR
-        offset = at + SECTOR
+    def read(self, offset, size):
+        if not self.use_sg:
+            return self._read_block(offset, size)
+        started = time.time()
         try:
-            os.lseek(fd, offset, os.SEEK_SET)
-        except OSError:
-            reopen(offset)
-        print(f"skipped unreadable sector at {at}", flush=True)
+            data = self._read_sg(offset, size)
+        except OSError as exc:
+            if exc.errno in (errno.ENODEV, errno.ENXIO):
+                raise
+            broken = exc.errno in (
+                errno.ENOTTY,
+                errno.EINVAL,
+                errno.EFAULT,
+                errno.EOPNOTSUPP,
+                errno.ENOSYS,
+            )
+            if not broken and time.time() - started < 0.15:
+                self.fast_fails += 1
+                broken = self.fast_fails >= 4
+            if broken:
+                print("timed reads are not available; skipping a megabyte on each error", flush=True)
+                self.use_sg = False
+                return self._read_block(offset, size)
+            raise
+        self.fast_fails = 0
+        return data
 
+    def _read_sg(self, offset, size):
+        import fcntl
+
+        sectors = size // SECTOR
+        lba = offset // SECTOR
+        cdb = self._cdb
+        cdb[0] = 0x28
+        cdb[2] = (lba >> 24) & 0xFF
+        cdb[3] = (lba >> 16) & 0xFF
+        cdb[4] = (lba >> 8) & 0xFF
+        cdb[5] = lba & 0xFF
+        cdb[7] = (sectors >> 8) & 0xFF
+        cdb[8] = sectors & 0xFF
+        hdr = SgIoHdr()
+        hdr.interface_id = ord("S")
+        hdr.dxfer_direction = SG_DXFER_FROM_DEV
+        hdr.cmd_len = 10
+        hdr.mx_sb_len = 64
+        hdr.dxfer_len = size
+        hdr.dxferp = ctypes.addressof(self._buf)
+        hdr.cmdp = ctypes.addressof(cdb)
+        hdr.sbp = ctypes.addressof(self._sense)
+        hdr.timeout = READ_TIMEOUT_MS
+        raw = ctypes.create_string_buffer(ctypes.sizeof(hdr))
+        ctypes.memmove(raw, ctypes.addressof(hdr), ctypes.sizeof(hdr))
+        try:
+            fcntl.ioctl(self.fd, SG_IO, raw)
+        except OSError:
+            raise
+        result = SgIoHdr.from_buffer_copy(raw.raw)
+        if result.masked_status == 0 and result.host_status == 0 and result.resid == 0:
+            return self._buf.raw[:size]
+        raise OSError(
+            errno.EIO,
+            f"read failed status={result.status} host={result.host_status} resid={result.resid}",
+        )
+
+    def _read_block(self, offset, size):
+        os.lseek(self.fd, offset, os.SEEK_SET)
+        data = os.read(self.fd, size)
+        if len(data) != size:
+            raise OSError(errno.EIO, "short read")
+        return data
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def copy(src, dest):
+    device = find_drive(src) or src
+    if not device:
+        print("no optical drive", flush=True)
+        return 2
+    offset = 0
+    if os.path.exists(dest):
+        offset = os.path.getsize(dest)
+        offset -= offset % SECTOR
+    out = open(dest, "r+b" if offset else "wb")
+    if offset:
+        out.seek(offset)
+    reader = Reader(device)
+    total = disc_size(reader.fd)
+    skipped = 0
+    reported = time.time()
+    print(f"copying {device} ({total} bytes) to {dest}", flush=True)
+    if offset:
+        print(f"resuming at {offset}", flush=True)
     try:
         while total == 0 or offset < total:
+            size = CHUNK
+            if total:
+                size = min(size, total - offset)
+                size -= size % SECTOR
+            if size <= 0:
+                break
             try:
-                data = os.read(fd, BIG)
+                data = reader.read(offset, size)
             except OSError as exc:
                 if exc.errno in (errno.ENODEV, errno.ENXIO):
-                    reopen(offset)
+                    reader.reopen(src)
                     continue
-                if exc.errno not in (errno.EIO, errno.EAGAIN, errno.ENOMEDIUM):
-                    raise
-                try:
-                    os.lseek(fd, offset, os.SEEK_SET)
-                except OSError:
-                    reopen(offset)
-                window_end = offset + (min(BIG, total - offset) if total else BIG)
-                while offset < window_end and (total == 0 or offset < total):
-                    try:
-                        block = os.read(fd, SECTOR)
-                    except OSError as inner:
-                        if inner.errno in (errno.ENODEV, errno.ENXIO):
-                            reopen(offset)
-                            continue
-                        skip_sector(offset)
-                        if skipped > SKIP_LIMIT:
-                            print(f"too much unreadable data ({skipped} bytes)", flush=True)
-                            return 2
-                        continue
-                    if not block:
-                        total = offset
-                        break
-                    out.write(block)
-                    offset += len(block)
+                jump = SKIP
+                if total:
+                    jump = min(jump, total - offset)
+                jump -= jump % SECTOR
+                if jump <= 0:
+                    break
+                write_zeros(out, jump)
+                print(f"skipped {jump} bytes at {offset}", flush=True)
+                skipped += jump
+                offset += jump
+                if skipped > SKIP_LIMIT:
+                    print(f"too much unreadable data ({skipped} bytes)", flush=True)
+                    return 2
                 continue
-            if not data:
-                break
             out.write(data)
             offset += len(data)
             now = time.time()
             if now - reported >= 20:
                 print(f"copied {offset} bytes, skipped {skipped}", flush=True)
+                out.flush()
                 reported = now
     finally:
+        out.flush()
         out.close()
-        if fd is not None:
-            os.close(fd)
+        reader.close()
     print(f"done bytes={offset} skipped={skipped}", flush=True)
     if offset < 1024 * 1024:
-        return 2
-    if skipped > SKIP_LIMIT:
         return 2
     return hide_hash_tables(dest)
 
