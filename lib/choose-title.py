@@ -342,10 +342,16 @@ def choose_feature(titles, audio_counts, lines=()):
     A movie MakeMKV skipped for a navigation error is still a candidate.
     """
     rows = title_rows(titles, audio_counts)
-    known = {item["id"] for item in rows}
+    by_id = {item["id"]: item for item in rows}
     for item in navigation_titles(lines):
-        if item["id"] not in known and item["sec"] >= 45 * 60:
+        if item["sec"] < 45 * 60:
+            continue
+        current = by_id.get(item["id"])
+        if current is None:
             rows.append(item)
+            by_id[item["id"]] = item
+        elif item["sec"] > current["sec"]:
+            current.update(item)
     if not rows:
         return None
     features = [item for item in rows if item["sec"] >= 45 * 60]
@@ -536,6 +542,10 @@ def lookup_title(name):
 
 def main():
     lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+    Path("/mnt/data/rip-work/state/last-info.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    hidden = navigation_titles(lines)
+    if hidden:
+        note("scan hid " + ", ".join(f"title {item["id"]} ({item["duration"]})" for item in hidden))
     if any("Failed to open disc" in line for line in lines):
         raise SystemExit("failed to open disc")
     disc = ""
@@ -567,6 +577,10 @@ def main():
     if chosen_title is None:
         raise SystemExit("no titles")
     best = chosen_title["id"]
+    note(
+        f"chose title {best} ({chosen_title["duration"]}, "
+        f"{chosen_title["chapters"]} chapters)"
+    )
 
     raw_name = clean_name(disc)
     label = disc_id or raw_name
