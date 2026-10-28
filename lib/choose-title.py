@@ -303,15 +303,78 @@ def title_rows(titles, audio_counts):
     return rows
 
 
-def choose_feature(titles, audio_counts):
-    """Prefer the chaptered feature over a one-chapter menu loop.
+NAV_ERROR = re.compile(
+    r"Title #(\d+) \(([^)]+)\) was skipped due to navigation error"
+)
 
-    A looping menu is often the longest title. It has one or two chapters.
-    The movie, or the play-all on a set like Planet Earth, has more.
+
+def navigation_titles(lines):
+    """MakeMKV hides some real movies. The duration is still in the message."""
+    found = []
+    seen = set()
+    for line in lines:
+        text = field(line) or line
+        match = NAV_ERROR.search(text)
+        if not match:
+            continue
+        title_id = int(match.group(1))
+        if title_id in seen:
+            continue
+        seen.add(title_id)
+        duration = match.group(2)
+        found.append({
+            "id": title_id,
+            "sec": seconds(duration),
+            "chapters": 1,
+            "size": 0,
+            "audio": 1,
+            "source": "navigation-error",
+            "duration": duration,
+        })
+    return found
+
+
+def choose_feature(titles, audio_counts, lines=()):
+    """Prefer a feature-length title over a short extra.
+
+    A looping menu is often the longest title and has one or two chapters.
+    A short extra can have more chapters than the movie. Length decides that.
+    A movie MakeMKV skipped for a navigation error is still a candidate.
     """
     rows = title_rows(titles, audio_counts)
+    known = {item["id"] for item in rows}
+    for item in navigation_titles(lines):
+        if item["id"] not in known and item["sec"] >= 45 * 60:
+            rows.append(item)
     if not rows:
         return None
+    features = [item for item in rows if item["sec"] >= 45 * 60]
+    if features:
+        chaptered = [
+            item for item in features
+            if item["chapters"] >= 4 and item["source"] != "navigation-error"
+        ]
+        pool = features
+        if chaptered:
+            longest_program = max(item["sec"] for item in chaptered)
+            pool = [
+                item for item in features
+                if item["source"] == "navigation-error"
+                or not (
+                    item["chapters"] <= 3
+                    and item["sec"] > 1.5 * longest_program
+                )
+            ] or features
+        return max(
+            pool,
+            key=lambda item: (
+                item["chapters"],
+                item["audio"],
+                1 if str(item["source"]).endswith(".mpls") else 0,
+                item["size"],
+                item["sec"],
+            ),
+        )
     longest = max(rows, key=lambda item: (item["sec"], item["size"]))
     real = [
         item for item in rows
@@ -500,7 +563,7 @@ def main():
                 audio_counts[int(match.group(1))] = audio_counts.get(int(match.group(1)), 0) + 1
     if not disc:
         raise SystemExit("no disc name")
-    chosen_title = choose_feature(titles, audio_counts)
+    chosen_title = choose_feature(titles, audio_counts, lines)
     if chosen_title is None:
         raise SystemExit("no titles")
     best = chosen_title["id"]
