@@ -188,6 +188,25 @@ HandBrakeCLI() {
 
 
 # The ripper calls makemkvcon by name. A scratch should not end the movie.
+
+# A read error plus a few hundred megabytes is the file ending at the scratch.
+saved_movie() {
+  local dest="$1" line size path
+  line="$(find "$dest" -type f -name '*.mkv' -printf '%s\t%p\n' 2>/dev/null | sort -nr | head -1)"
+  [[ -n "$line" ]] || return 1
+  size="${line%%$'\t'*}"
+  path="${line#*$'\t'}"
+  if [[ "$size" -lt 1048576 ]]; then
+    return 1
+  fi
+  if grep -q -E "UNCORRECTABLE|MEDIUM ERROR" "$dest/rip.log" 2>/dev/null && [[ "$size" -lt 800000000 ]]; then
+    printf '%s\n' "saved file is too small after a read error; copying around the bad spot"
+    rm -f "$path"
+    return 1
+  fi
+  return 0
+}
+
 makemkvcon() {
   local cmd="" source="" title="" dest="" i next
   for ((i=1; i<=$#; i++)); do
@@ -205,10 +224,11 @@ makemkvcon() {
     command makemkvcon "$@"
     return
   fi
-  # MakeMKV exits 0 even when it saved nothing. A missing file is a failure.
+  # MakeMKV exits 0 even when it saved nothing. A short file after a read
+  # error is the movie cut off at the scratch, not a finished rip.
   if [[ ! -f "${STATE_DIR:-}/skip-bad-sectors" ]]; then
     command makemkvcon "$@" || true
-    if [[ -d "$dest" ]] && find "$dest" -type f -name '*.mkv' -size +1M | grep -q .; then
+    if saved_movie "$dest"; then
       return 0
     fi
   else
@@ -230,7 +250,7 @@ makemkvcon() {
     fi
   done
   command makemkvcon "${args[@]}" || true
-  if [[ -d "$dest" ]] && find "$dest" -type f -name '*.mkv' -size +1M | grep -q .; then
+  if saved_movie "$dest"; then
     rm -f "$image"
     return 0
   fi
