@@ -568,8 +568,21 @@ def alpha_words(hint):
 
 
 def opaque_label(hint):
-    """A catalog code. Semantic search will invent a movie for one of these."""
-    return not alpha_words(hint)
+    """A catalog code. Semantic search will invent a movie for one of these.
+
+    A glued all-caps token looks like a word. It is still a code.
+    A short title, or a label with separate words, is not.
+    """
+    if not alpha_words(hint):
+        return True
+    label = (hint or "").strip()
+    raw = "".join(char for char in label if char.isalnum())
+    return bool(
+        raw
+        and raw == label
+        and label.upper() == label
+        and (any(char.isdigit() for char in raw) or len(raw) >= 7)
+    )
 
 
 def label_fit(title, hint):
@@ -788,13 +801,13 @@ def reconcile(transcript, hint, duration, dialogue, label, combined):
     if official and label_ok and len(hint_letters) >= 6 and hint_letters in title_letters:
         confident = True
     if opaque_label(hint):
-        rare = {
-            token for token in set(tokens(chosen)) & set(tokens(transcript))
-            if len(token) >= 5 and token not in {"there", "would", "could", "about", "movie"}
-        }
-        if not rare:
+        # Commentary can mention another film. That is not this disc's title
+        # unless the code itself is inside the title.
+        code_letters = re.sub(r"[^a-z]", "", re.sub(r"\d+", "", (hint or "").lower()))
+        named_letters = re.sub(r"[^a-z]", "", (chosen or "").lower())
+        if not code_letters or code_letters not in named_letters:
             confident = False
-            reason += "; code label did not match a distinctive spoken word"
+            reason += "; catalog code does not match the title"
     if listed and not (set(tokens(chosen)) - set(tokens(hint))) & set(tokens(transcript)):
         distinctive = {token for token in set(tokens(hint)) & set(tokens(chosen)) if len(token) >= 5}
         numbered = any(word.isdigit() and int(word) <= 10 for word in re.findall(r"\d+", hint))

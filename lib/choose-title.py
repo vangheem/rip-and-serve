@@ -147,6 +147,7 @@ def load_rules():
     fingerprints = {}
     durations = {}
     series = {}
+    labels = {}
     try:
         lines = NAMES_PATH.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -166,7 +167,9 @@ def load_rules():
             durations[(parts[1], parts[2])] = value
         elif parts[0] == "series" and len(parts) == 2:
             series[parts[1]] = value
-    return fingerprints, durations, series
+        elif parts[0] == "label" and len(parts) == 2:
+            labels[parts[1]] = value
+    return fingerprints, durations, series, labels
 
 
 def existing_names():
@@ -586,13 +589,17 @@ def main():
     label = disc_id or raw_name
     duration = chosen_title["duration"]
     fingerprint = disc_fingerprint(device_path())
-    by_fingerprint, by_duration, by_series = load_rules()
+    by_fingerprint, by_duration, by_series, by_label = load_rules()
 
     chosen = ""
     if fingerprint and fingerprint.lower() in by_fingerprint:
         chosen = by_fingerprint[fingerprint.lower()]
     elif (label, duration) in by_duration:
         chosen = by_duration[(label, duration)]
+    elif label in by_label:
+        chosen = by_label[label]
+    elif raw_name in by_label:
+        chosen = by_label[raw_name]
     elif label in by_series and (catalog_code(raw_name) or raw_name == label):
         used = existing_names()
         used.update(by_fingerprint.values())
