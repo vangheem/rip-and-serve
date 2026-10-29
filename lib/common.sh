@@ -187,7 +187,8 @@ HandBrakeCLI() {
 }
 
 
-# The ripper calls makemkvcon by name. A scratch should not end the movie.
+# The ripper calls makemkvcon by name. A scratch ends the rip. Imaging the
+# disc to skip bad sectors grinds the drive for hours.
 
 # A read error plus a few hundred megabytes is the file ending at the scratch.
 saved_movie() {
@@ -200,7 +201,7 @@ saved_movie() {
     return 1
   fi
   if grep -q -E "UNCORRECTABLE|MEDIUM ERROR" "$dest/rip.log" 2>/dev/null && [[ "$size" -lt 800000000 ]]; then
-    printf '%s\n' "saved file is too small after a read error; copying around the bad spot"
+    printf '%s\n' "saved file is too small after a read error"
     rm -f "$path"
     return 1
   fi
@@ -225,33 +226,11 @@ makemkvcon() {
     return
   fi
   # MakeMKV exits 0 even when it saved nothing. A short file after a read
-  # error is the movie cut off at the scratch, not a finished rip.
-  if [[ ! -f "${STATE_DIR:-}/skip-bad-sectors" ]]; then
-    command makemkvcon "$@" || true
-    if saved_movie "$dest"; then
-      return 0
-    fi
-  else
-    rm -f "${STATE_DIR:-}/skip-bad-sectors"
-    printf '%s\n' "this disc scratched last time; copying around the bad part first"
-  fi
-  local device="${source#dev:}" image args=() arg replaced=0
-  image="$dest/disc-skip.iso"
-  printf '%s\n' "unreadable spot on $device; copying around it and continuing"
-  if ! python3 "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/copy-disc.py" "$device" "$image"; then
-    return 1
-  fi
-  for arg in "$@"; do
-    if [[ "$replaced" == 0 && "$arg" == "$source" ]]; then
-      args+=("iso:$image")
-      replaced=1
-    else
-      args+=("$arg")
-    fi
-  done
-  command makemkvcon "${args[@]}" || true
+  # error is the movie cut off at the scratch, not a finished rip. Do not
+  # image the disc to get past it.
+  rm -f "${STATE_DIR:-}/skip-bad-sectors"
+  command makemkvcon "$@" || true
   if saved_movie "$dest"; then
-    rm -f "$image"
     return 0
   fi
   return 1
