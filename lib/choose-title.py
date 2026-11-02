@@ -485,6 +485,30 @@ def identified_title(name):
     return ""
 
 
+def glued_title(name):
+    """THEILLUSIONIST has no word breaks. Match the whole label to a catalog title."""
+    words = name_tokens(name)
+    if len(words) != 1 or len(words[0]) < 10:
+        return ""
+    needle = words[0]
+    path = Path("/mnt/data/rip-work/state/imdb/titles.json")
+    try:
+        index = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    hits = [hit for key, hit in index.items() if key.replace(" ", "") == needle]
+    if not hits:
+        return ""
+    hits.sort(key=lambda item: item.get("votes") or 0, reverse=True)
+    best = hits[0]
+    votes = best.get("votes") or 0
+    if votes < 1000:
+        return ""
+    if len(hits) > 1 and votes <= 4 * (hits[1].get("votes") or 0):
+        return ""
+    return best.get("title") or ""
+
+
 def lookup_title(name):
     """Turn a volume label into a movie title. A miss must not fail the rip."""
     if not needs_lookup(name):
@@ -492,6 +516,13 @@ def lookup_title(name):
     cache = load_cache()
     if name in cache:
         return "" if cache[name] == "-" else cache[name]
+    glued = glued_title(name)
+    if glued:
+        pretty = clean_name(glued)
+        cache[name] = pretty
+        save_cache(cache)
+        note(f"named {name} as {pretty}")
+        return pretty
     query = " ".join(name_tokens(name))
     if not query:
         return ""

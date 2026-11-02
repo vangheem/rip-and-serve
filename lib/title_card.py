@@ -45,6 +45,10 @@ STUDIO = {
     "disney", "pixar", "pictures", "starring", "christmas", "animation",
     "universal", "paramount", "warner", "brothers", "presents", "columbia",
     "dreamworks", "nickelodeon", "entertainment", "productions", "studios",
+    # A distributor card is not the movie. "releasing" named The Illusionist
+    # as a Strand Releasing compilation.
+    "releasing", "distribution", "distributed", "production", "producer",
+    "producers", "copyright", "reserved", "rights", "films", "cinema",
 }
 
 
@@ -86,6 +90,10 @@ def rare_title(text):
             if not hits:
                 continue
             if len(hits) == 1 or hits[0]["votes"] > 4 * hits[1]["votes"]:
+                # One word that only an obscure title uses is a credit line.
+                # Real title-card words (padawan, marian) are well above this.
+                if hits[0]["votes"] < 1000:
+                    continue
                 found.append((hits[0], word))
     return found
 

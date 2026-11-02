@@ -842,12 +842,21 @@ def title_card_decision(media):
         "confident": True,
         "reason": found["reason"],
         "duration": found.get("duration") or 0,
+        "votes": found.get("votes") or 0,
         "transcript": "",
     }
 
 
 def identify(media, hint, refresh_search=False):
     card = title_card_decision(media)
+    # A studio card can still invent an obscure title. Do not let that replace
+    # a readable disc label. Catalog codes have nothing else to go on.
+    if card and (card.get("votes") or 0) < 1000 and not opaque_label(hint):
+        log(
+            f"ignoring title card {card['title']} "
+            f"({card.get('votes')} votes) for {hint}"
+        )
+        card = None
     if card:
         return card
     media = Path(media)
