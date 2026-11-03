@@ -699,7 +699,12 @@ def main():
     if not chosen:
         chosen = identified_title(raw_name) or identified_title(label)
     if not chosen:
-        chosen = expand_disc_set(raw_name) or lookup_title(raw_name) or raw_name
+        chosen = (
+            expand_disc_set(raw_name)
+            or lookup_title(raw_name)
+            or (lookup_title(label) if label and label != raw_name else "")
+            or raw_name
+        )
     chosen = clean_name(chosen)
     try:
         import title_card

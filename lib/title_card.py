@@ -99,6 +99,37 @@ def year_for(title, minutes=None):
     return best.get("year") or 0
 
 
+def title_for_length(hint, seconds):
+    """A one-word label plus the file length. "SOLDIERS" at 138 minutes is We Were Soldiers."""
+    words = catalog_key(hint).split()
+    words = [word for word in words if len(word) >= 6]
+    if len(words) != 1 or not seconds:
+        return ""
+    minutes = seconds / 60
+    if minutes < 60:
+        return ""
+    load_index()
+    needle = words[0]
+    hits = []
+    for hit in _INDEX.values():
+        runtime = hit.get("runtime") or 0
+        if not runtime or abs(minutes - runtime) > 8:
+            continue
+        if needle not in catalog_key(hit.get("title") or "").split():
+            continue
+        if (hit.get("votes") or 0) < 10000:
+            continue
+        hits.append(hit)
+    if not hits:
+        return ""
+    hits.sort(key=lambda hit: hit.get("votes") or 0, reverse=True)
+    best = hits[0]
+    second = hits[1] if len(hits) > 1 else None
+    if second and (best.get("votes") or 0) < 4 * ((second.get("votes") or 0) or 1):
+        return ""
+    return best.get("title") or ""
+
+
 def dated_name(name, minutes=None):
     """Title (2005). A disc number stays after the year."""
     text = (name or "").strip()

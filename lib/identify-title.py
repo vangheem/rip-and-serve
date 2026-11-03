@@ -815,11 +815,17 @@ def reconcile(transcript, hint, duration, dialogue, label, combined):
     if not official:
         confident = False
         reason += "; no catalog match"
-    if official and combined_ok and label_ok:
+    # An empty transcript makes the three searches the same label query.
+    # That list agreeing with itself is not confirmation.
+    if official and combined_ok and label_ok and (transcript or "").strip():
         confident = True
     hint_letters = re.sub(r"[^a-z]", "", re.sub(r"\d+", "", hint.lower()))
     title_letters = re.sub(r"[^a-z]", "", (official or "").lower())
-    if official and label_ok and len(hint_letters) >= 6 and hint_letters in title_letters:
+    # "SOLDIERS" is inside "Saints and Soldiers". That is not this disc.
+    if (
+        official and label_ok and len(hint_letters) >= 6 and hint_letters in title_letters
+        and len(title_letters) - len(hint_letters) <= 4
+    ):
         confident = True
     if opaque_label(hint):
         # Commentary can mention another film. That is not this disc's title
@@ -930,6 +936,19 @@ def identify(media, hint, refresh_search=False):
         searches.get("label") or {},
         searches.get("combined") or {},
     )
+    if not decision.get("confident") and not (transcript or "").strip():
+        try:
+            import title_card
+            found = title_card.title_for_length(hint, duration)
+        except (OSError, ValueError, json.JSONDecodeError):
+            found = ""
+        if found:
+            decision = {
+                "title": clean_filename(found),
+                "guess": clean_filename(found),
+                "confident": True,
+                "reason": f"catalog runtime matches {found}",
+            }
     decision["duration"] = duration
     decision["transcript"] = transcript
     cached["decision"] = {
