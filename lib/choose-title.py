@@ -469,9 +469,15 @@ def save_cache(cache):
         pass
 
 
+GENERIC_LABELS = {
+    "dvd video", "bluray", "blu ray", "bd rom", "video ts",
+}
+
+
 def identified_title(name):
     """A title learned from dialogue. Unique labels only; shared codes are not here."""
-    if not name:
+    folded = re.sub(r"[\s_-]+", " ", (name or "").lower()).strip()
+    if not name or folded in GENERIC_LABELS:
         return ""
     try:
         lines = IDENTIFIED_PATH.read_text(encoding="utf-8").splitlines()
@@ -507,6 +513,60 @@ def glued_title(name):
     if len(hits) > 1 and votes <= 4 * (hits[1].get("votes") or 0):
         return ""
     return best.get("title") or ""
+
+
+DISC_LABEL = re.compile(r"^(?P<stem>.+?)\s+dis[ck]\s+(?P<number>\d+)$", re.I)
+SERIES_KINDS = {"tvseries", "tvminiseries", "tv series", "tv mini-series"}
+
+
+def expand_disc_set(name):
+    """Pride Disc 1 is a truncated series title, not a finished movie name."""
+    if re.search(r"\s-\s+disc\s+\d+$", name or "", re.I):
+        return ""
+    match = DISC_LABEL.match((name or "").strip())
+    if not match:
+        return ""
+    stem = re.sub(r"[\s\-]+$", "", match.group("stem")).strip()
+    number = int(match.group("number"))
+    words = name_tokens(stem)
+    if len(words) != 1 or len(words[0]) < 4:
+        return ""
+    query = words[0]
+    url = (
+        "https://v2.sg.media-imdb.com/suggestion/"
+        + urllib.parse.quote(query[0])
+        + "/"
+        + urllib.parse.quote(query)
+        + ".json"
+    )
+    try:
+        request = urllib.request.Request(url, headers={
+            "User-Agent": "personal-ripper/1.0",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        note(f"series lookup failed for {name}")
+        return ""
+    best = None
+    best_rank = 5001
+    for item in payload.get("d") or []:
+        kind = (item.get("q") or "").lower()
+        if kind not in SERIES_KINDS:
+            continue
+        title = item.get("l") or ""
+        got = name_tokens(title)
+        if not got or got[0] != query:
+            continue
+        rank = item.get("rank") or 0
+        if not rank or rank > 5000 or rank >= best_rank:
+            continue
+        best_rank = rank
+        best = title
+    if not best:
+        return ""
+    return f"{clean_name(best)} - Disc {number}"
 
 
 def lookup_title(name):
@@ -639,8 +699,17 @@ def main():
     if not chosen:
         chosen = identified_title(raw_name) or identified_title(label)
     if not chosen:
-        chosen = lookup_title(raw_name) or raw_name
+        chosen = expand_disc_set(raw_name) or lookup_title(raw_name) or raw_name
     chosen = clean_name(chosen)
+    try:
+        import title_card
+        minutes = 0
+        parts = (duration or "").split(":")
+        if len(parts) == 3:
+            minutes = int(parts[0]) * 60 + int(parts[1])
+        chosen = title_card.dated_name(chosen, minutes or None)
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
 
     # A shared catalog label must not be the hold id, or the next disc in the
     # set is skipped. A unique label can keep its own id so the cheap skip works.

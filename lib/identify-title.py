@@ -88,9 +88,20 @@ def catalog_code(name):
     return bool(re.fullmatch(r"[A-Z]{0,3}\d{3,6}", name or ""))
 
 
+def explicit_disc_number(stem):
+    """A printed 'Disc 2' is a set. A glued D1 on a volume label is not."""
+    match = re.search(r"\bdis[ck]\s+(\d+)\b", stem or "", re.I)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
 def needs_identify(stem):
     """A finished title has normal words. A disc label does not."""
     if not stem:
+        return True
+    # "Pride Disc 1" is the first word of a series, not the title.
+    if explicit_disc_number(stem) and len(tokens(re.sub(r"\bdis[ck]\s+\d+\b", " ", stem, flags=re.I))) <= 1:
         return True
     if re.search(r"[a-z]", stem) and "_" not in stem and "#" not in stem:
         return False
@@ -173,12 +184,22 @@ def save_map(path, mapping):
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
+GENERIC_LABELS = {
+    "dvd video", "bluray", "blu ray", "bd rom", "video ts",
+}
+
+
+def shared_label(label):
+    folded = re.sub(r"[\s_-]+", " ", (label or "").lower()).strip()
+    return folded in GENERIC_LABELS or catalog_code(label) or label in series_labels()
+
+
 def remember(label, title):
     label = (label or "").strip()
     title = clean_filename(title)
     if not label or not title or label == title:
         return
-    if catalog_code(label) or label in series_labels():
+    if shared_label(label):
         log(f"not remembering shared label {label}")
         return
     mapping = load_map(IDENTIFIED)
@@ -843,6 +864,7 @@ def title_card_decision(media):
         "reason": found["reason"],
         "duration": found.get("duration") or 0,
         "votes": found.get("votes") or 0,
+        "year": found.get("year") or 0,
         "transcript": "",
     }
 
@@ -976,8 +998,26 @@ def taken_names():
     return {path.stem for path in dest_root().glob("*.mp4")}
 
 
+def with_year(filename, year=None, minutes=None):
+    text = clean_filename(filename)
+    if year and not re.search(r"\(\d{4}\)", text):
+        match = re.match(r"^(?P<title>.+?)(?:\s+-\s+Disc\s+(?P<number>\d+))?$", text)
+        dated = f"{match.group('title')} ({int(year)})"
+        if match.group("number"):
+            return f"{dated} - Disc {match.group('number')}"
+        return dated
+    try:
+        import title_card
+        return title_card.dated_name(text, minutes)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return text
+
+
 def assign_filename(title, hint, taken):
     plain = clean_filename(title)
+    number = explicit_disc_number(hint)
+    if number:
+        return f"{plain} - Disc {number}"
     numbered = [name for name in taken if name == plain or name.startswith(plain + " - Disc ")]
     if not numbered:
         number = disc_number(hint)
@@ -1019,6 +1059,8 @@ def apply_job(job):
         log(f"unsure about {disc_name}: {decision['reason']} guess={decision.get('guess')}")
         return 0
     filename = assign_filename(decision["title"], disc_name, taken_names())
+    minutes = int((decision.get("duration") or 0) // 60) or None
+    filename = with_year(filename, decision.get("year"), minutes)
     if not filename:
         log(f"{disc_name} looks like {decision['title']}, which is already in the library")
         return 0
@@ -1137,6 +1179,8 @@ def fix_library():
         for index, (path, _decision) in enumerate(items, 1):
             number = markers[index - 1] if use_markers else (index if len(items) > 1 else None)
             filename = planned_name(title, path.stem, taken, number if len(items) > 1 else None)
+            minutes = int((_decision.get("duration") or 0) // 60) or None
+            filename = with_year(filename, _decision.get("year"), minutes)
             if not filename or filename in taken:
                 log(f"leaving {path.name}; {title} is already in the library")
                 unsure.append(f"{path.name}: collides with {title}")

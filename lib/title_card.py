@@ -54,7 +54,66 @@ STUDIO = {
 
 def norm(value):
     text = (value or "").lower().replace("\u2019", "").replace("'", "").replace("`", "")
+    text = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text)).strip()
+    # "g a t t a c a" is a title card, not seven words.
+    return re.sub(
+        r"\b(?:[a-z0-9] ){3,}[a-z0-9]\b",
+        lambda match: match.group(0).replace(" ", ""),
+        text,
+    )
+
+
+def catalog_key(value):
+    text = (value or "").lower().replace("&", " and ").replace("'", "")
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text)).strip()
+
+
+def year_for(title, minutes=None):
+    """The catalog year for a title. Length picks the edition when several exist."""
+    stem = re.sub(r"\s+\(\d{4}\)$", "", title or "").strip()
+    if not stem:
+        return 0
+    load_index()
+    hits = [hit for hit in _INDEX.values() if catalog_key(hit.get("title")) == catalog_key(stem)]
+    if not hits:
+        return 0
+
+    def fits(hit):
+        runtime = hit.get("runtime") or 0
+        if not minutes or not runtime:
+            return False
+        kind = hit.get("type") or ""
+        if kind in {"tvMiniSeries", "tvSeries"} and runtime <= 70:
+            return minutes >= runtime * 1.4
+        return abs(minutes - runtime) <= 12
+
+    fitting = [hit for hit in hits if fits(hit)]
+    pool = fitting or hits
+    pool.sort(key=lambda hit: hit.get("votes") or 0, reverse=True)
+    best = pool[0]
+    if not fitting and minutes and best.get("runtime") and abs(minutes - best["runtime"]) > 25:
+        return 0
+    second = pool[1] if len(pool) > 1 else None
+    if not fitting and second and (best.get("votes") or 0) < 8 * ((second.get("votes") or 0) or 1):
+        return 0
+    return best.get("year") or 0
+
+
+def dated_name(name, minutes=None):
+    """Title (2005). A disc number stays after the year."""
+    text = (name or "").strip()
+    if not text or re.search(r"\(\d{4}\)", text):
+        return text
+    match = re.match(r"^(?P<title>.+?)(?:\s+-\s+Disc\s+(?P<number>\d+))?$", text)
+    title = match.group("title")
+    number = match.group("number")
+    year = year_for(title, minutes)
+    if not year:
+        return text
+    dated = f"{title} ({year})"
+    if number:
+        return f"{dated} - Disc {number}"
+    return dated
 
 
 def load_index():
@@ -75,26 +134,41 @@ def load_index():
     return _INDEX
 
 
+LINE_SKIP = {"the", "and", "for", "with", "from", "that", "this"}
+
+
+def line_supports(line, hit):
+    """The line has to be the title. A credit that shares one word is not."""
+    known = set(norm(hit["title"]).split())
+    extra = [
+        word for word in line.split()
+        if len(word) >= 3 and word not in known and word not in STUDIO and word not in LINE_SKIP
+    ]
+    return not extra
+
+
 def rare_title(text):
     load_index()
     found = []
     seen = set()
     for raw in text.splitlines():
-        for word in norm(raw).split():
+        line = norm(raw)
+        for word in line.split():
             if len(word) < 6 or word in STUDIO or word in seen:
                 continue
-            seen.add(word)
             hits = _WORDS.get(word) or []
             hits = [hit for hit in hits if hit["votes"] >= 80]
             hits.sort(key=lambda item: item["votes"], reverse=True)
             if not hits:
                 continue
-            if len(hits) == 1 or hits[0]["votes"] > 4 * hits[1]["votes"]:
-                # One word that only an obscure title uses is a credit line.
-                # Real title-card words (padawan, marian) are well above this.
-                if hits[0]["votes"] < 1000:
-                    continue
-                found.append((hits[0], word))
+            if not (len(hits) == 1 or hits[0]["votes"] > 4 * hits[1]["votes"]):
+                continue
+            # One word that only an obscure title uses is a credit line.
+            # Real title-card words (padawan, marian) are well above this.
+            if hits[0]["votes"] < 1000 or not line_supports(line, hits[0]):
+                continue
+            seen.add(word)
+            found.append((hits[0], word))
     return found
 
 
