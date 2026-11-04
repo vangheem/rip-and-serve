@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Copy a disc, repeating the last good piece where the drive cannot read.
 
-A bad sector used to be retried one 2 KB block at a time, and the drive can
-sit for 30 seconds on each one. A scratch should cost a moment of the movie,
-not hours. On a failed read, skip a megabyte and fill it with the last good
-piece, so the movie still opens.
+The drive retries one bad sector for a long time. A scratch should cost one
+short timeout and a jump, not a grind across every sector. The first jump is
+16 MB. If the next read also fails, the jump doubles up to 32 MB, then
+resets after a good read. The hole is filled with the last good piece so the
+movie still opens.
 
 An existing image is continued, not started over.
 """
@@ -19,12 +20,16 @@ import time
 SECTOR = 2048
 UNIT = 6144
 CHUNK = 85 * UNIT
-SKIP = 170 * UNIT
-READ_TIMEOUT_MS = 5000
+# 16 MB, then 32 MB if the scratch continues. A wedged drive used to look
+# like a multi-gigabyte hole when the jump kept doubling.
+SKIP_MIN = 2731 * UNIT
+SKIP_MAX = 5462 * UNIT
+SETTLE_SECONDS = 2
+READ_TIMEOUT_MS = 12000
 SKIP_LIMIT = 2 * 1024 * 1024 * 1024
 SG_IO = 0x2285
 SG_DXFER_FROM_DEV = -3
-ZEROS = b"\0" * SKIP
+ZEROS = b"\0" * (1024 * 1024)
 
 
 class SgIoHdr(ctypes.Structure):
@@ -261,9 +266,11 @@ def copy(src, dest):
     reader = Reader(device)
     total = disc_size(reader.fd)
     skipped = 0
+    jump_size = SKIP_MIN
     last_unit = None
     reported = time.time()
     print(f"copying {device} ({total} bytes) to {dest}", flush=True)
+    print(f"a bad read skips {SKIP_MIN} bytes, up to {SKIP_MAX}", flush=True)
     if offset:
         print(f"resuming at {offset}", flush=True)
     try:
@@ -280,7 +287,23 @@ def copy(src, dest):
                 if exc.errno in (errno.ENODEV, errno.ENXIO):
                     reader.reopen(src)
                     continue
-                jump = SKIP
+                # A slow good read can miss a short timeout. Retry the same
+                # spot before giving up a large stretch of the movie.
+                data = None
+                for _ in range(2):
+                    time.sleep(SETTLE_SECONDS)
+                    try:
+                        data = reader.read(offset, size)
+                        break
+                    except OSError:
+                        data = None
+                if data:
+                    jump_size = SKIP_MIN
+                    last_unit = last_good_unit(offset, data, last_unit)
+                    out.write(data)
+                    offset += len(data)
+                    continue
+                jump = jump_size
                 if total:
                     jump = min(jump, total - offset)
                 jump -= jump % UNIT
@@ -290,10 +313,12 @@ def copy(src, dest):
                 print(f"skipped {jump} bytes at {offset}", flush=True)
                 skipped += jump
                 offset += jump
+                jump_size = min(jump_size * 2, SKIP_MAX)
                 if skipped > SKIP_LIMIT:
                     print(f"too much unreadable data ({skipped} bytes)", flush=True)
                     return 2
                 continue
+            jump_size = SKIP_MIN
             last_unit = last_good_unit(offset, data, last_unit)
             out.write(data)
             offset += len(data)

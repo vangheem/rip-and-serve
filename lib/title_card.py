@@ -11,6 +11,8 @@ import os
 import re
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 FFMPEG = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
@@ -76,7 +78,7 @@ def year_for(title, minutes=None):
     load_index()
     hits = [hit for hit in _INDEX.values() if catalog_key(hit.get("title")) == catalog_key(stem)]
     if not hits:
-        return 0
+        return year_from_suggest(stem)
 
     def fits(hit):
         runtime = hit.get("runtime") or 0
@@ -97,6 +99,46 @@ def year_for(title, minutes=None):
     if not fitting and second and (best.get("votes") or 0) < 8 * ((second.get("votes") or 0) or 1):
         return 0
     return best.get("year") or 0
+
+
+def year_from_suggest(title):
+    """T2 Judgment Day is not the catalog key. The feature hit still has the year."""
+    query = (title or "").strip()
+    wanted = [word for word in catalog_key(query).split() if len(word) >= 4]
+    if not wanted:
+        return 0
+    url = (
+        "https://v2.sg.media-imdb.com/suggestion/"
+        + urllib.parse.quote(query[0])
+        + "/"
+        + urllib.parse.quote(query)
+        + ".json"
+    )
+    try:
+        request = urllib.request.Request(url, headers={
+            "User-Agent": "personal-ripper/1.0",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 0
+    kinds = {"feature", "movie", "tvseries", "tvminiseries", "tv series", "tv mini-series"}
+    best_rank = 20001
+    best_year = 0
+    for item in payload.get("d") or []:
+        if (item.get("q") or "").lower() not in kinds:
+            continue
+        got = set(catalog_key(item.get("l") or "").split())
+        if not all(word in got for word in wanted):
+            continue
+        rank = item.get("rank") or 0
+        year = item.get("y") or 0
+        if not rank or not year or rank > 20000 or rank >= best_rank:
+            continue
+        best_rank = rank
+        best_year = year
+    return best_year
 
 
 def title_for_length(hint, seconds):

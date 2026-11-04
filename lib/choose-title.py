@@ -374,14 +374,26 @@ def choose_feature(titles, audio_counts, lines=()):
                     and item["sec"] > 1.5 * longest_program
                 )
             ] or features
+        # A behind-the-scenes piece can have more chapters than the movie
+        # and still be long enough to look like a feature. Quantum of Solace
+        # offered a 45-minute extra with 34 chapters against the 1:46 film.
+        longest_feature = max(features, key=lambda item: item["sec"])
+        if longest_feature["sec"] >= 70 * 60 and longest_feature["chapters"] >= 8:
+            shorter = [
+                item for item in pool
+                if item["sec"] < longest_feature["sec"] * 0.75
+                and item["source"] != "navigation-error"
+            ]
+            if shorter and len(shorter) < len(pool):
+                pool = [item for item in pool if item not in shorter]
         return max(
             pool,
             key=lambda item: (
+                item["sec"],
                 item["chapters"],
                 item["audio"],
                 1 if str(item["source"]).endswith(".mpls") else 0,
                 item["size"],
-                item["sec"],
             ),
         )
     longest = max(rows, key=lambda item: (item["sec"], item["size"]))

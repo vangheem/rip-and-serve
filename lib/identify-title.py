@@ -844,6 +844,10 @@ def reconcile(transcript, hint, duration, dialogue, label, combined):
     if duration and duration < 40 * 60 and fit >= 6 and not opaque_label(hint) and sources.get(best_key, {}).get("short") and combined_ok:
         confident = bool(chosen)
         reason += "; short matches the label"
+    # A local screening listing is not the film. "… Butte365" came from a search page.
+    if chosen and (len(chosen) > 55 or "…" in chosen or "..." in chosen):
+        confident = False
+        reason += "; title is a listing, not a film"
     return {
         "title": clean_filename(chosen) if confident else "",
         "guess": clean_filename(chosen),

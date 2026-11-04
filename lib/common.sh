@@ -187,8 +187,9 @@ HandBrakeCLI() {
 }
 
 
-# The ripper calls makemkvcon by name. A scratch ends the rip. Imaging the
-# disc to skip bad sectors grinds the drive for hours.
+# The ripper calls makemkvcon by name. A scratch must not be retried sector
+# by sector. The first medium error stops MakeMKV. The disc is copied with
+# large jumps, then the movie is ripped from that image.
 
 # A read error plus a few hundred megabytes is the file ending at the scratch.
 saved_movie() {
@@ -208,8 +209,51 @@ saved_movie() {
   return 0
 }
 
+scratch_error() {
+  local log="$1"
+  [[ -f "$log" ]] || return 1
+  grep -q -E "UNCORRECTABLE|MEDIUM ERROR" "$log"
+}
+
+recover_scratched_disc() {
+  local device="$1" title="$2" dest="$3"
+  local image="$dest/disc.iso"
+  log "read error; copying around the scratch in large jumps"
+  write_status ripping "copying around the scratch" "$dest"
+  printf '%s\n' "$dest" > "$STATE_DIR/scratch-copy"
+  rm -f "$dest"/*.mkv
+  if ! python3 /usr/local/lib/rip-bluray/copy-disc.py "$device" "$image"; then
+    rm -f "$STATE_DIR/scratch-copy"
+    log "scratch copy failed for $dest"
+    return 1
+  fi
+  eject -r "$device" || eject -s "$device" || true
+  log "scratch copy done; ripping title $title from the image"
+  write_status ripping "ripping the recovered image" "$dest"
+  command makemkvcon --progress=-stdout --cache="${CACHE:-512}" mkv "iso:$image" "$title" "$dest" > "$dest/image-rip.log" 2>&1 || true
+  cat "$dest/image-rip.log" || true
+  rm -f "$STATE_DIR/scratch-copy"
+  # The drive log still contains the scratch error. Judge the image rip on
+  # its own result, not that earlier line.
+  if grep -q "Copy complete" "$dest/image-rip.log" && saved_image_movie "$dest"; then
+    rm -f "$image"
+    return 0
+  fi
+  log "image rip did not produce the movie"
+  return 1
+}
+
+saved_image_movie() {
+  local dest="$1" line size
+  line="$(find "$dest" -type f -name '*.mkv' -printf '%s\t%p\n' 2>/dev/null | sort -nr | head -1)"
+  [[ -n "$line" ]] || return 1
+  size="${line%%$'\t'*}"
+  # A 98-minute DVD that survived the scratch is at least a couple of gigabytes.
+  [[ "$size" -ge 1500000000 ]]
+}
+
 makemkvcon() {
-  local cmd="" source="" title="" dest="" i next
+  local cmd="" source="" title="" dest="" i next child copied size scratched
   for ((i=1; i<=$#; i++)); do
     if [[ "${!i}" == "mkv" ]]; then
       cmd=mkv
@@ -226,12 +270,40 @@ makemkvcon() {
     return
   fi
   # MakeMKV exits 0 even when it saved nothing. A short file after a read
-  # error is the movie cut off at the scratch, not a finished rip. Do not
-  # image the disc to get past it.
-  rm -f "${STATE_DIR:-}/skip-bad-sectors"
-  command makemkvcon "$@" || true
-  if saved_movie "$dest"; then
+  # error is the movie cut off at the scratch. Stop at the first bad read
+  # and copy around it instead of letting the drive retry.
+  rm -f "$dest/drive-rip.log"
+  command makemkvcon "$@" > "$dest/drive-rip.log" 2>&1 &
+  child=$!
+  copied=0
+  scratched=0
+  while kill -0 "$child" 2>/dev/null; do
+    if scratch_error "$dest/drive-rip.log"; then
+      log "stopping MakeMKV at the first bad read"
+      kill "$child" 2>/dev/null || true
+      sleep 1
+      kill -9 "$child" 2>/dev/null || true
+      scratched=1
+      break
+    fi
+    size="$(wc -c < "$dest/drive-rip.log" 2>/dev/null || echo 0)"
+    if (( size > copied )); then
+      tail -c +$((copied + 1)) "$dest/drive-rip.log" || true
+      copied=$size
+    fi
+    sleep 5
+  done
+  wait "$child" 2>/dev/null || true
+  size="$(wc -c < "$dest/drive-rip.log" 2>/dev/null || echo 0)"
+  if (( size > copied )); then
+    tail -c +$((copied + 1)) "$dest/drive-rip.log" || true
+  fi
+  if [[ "$scratched" == "0" ]] && saved_movie "$dest"; then
     return 0
+  fi
+  if [[ "$scratched" == "1" ]] || scratch_error "$dest/drive-rip.log" || scratch_error "$dest/rip.log"; then
+    recover_scratched_disc "${source#dev:}" "$title" "$dest"
+    return
   fi
   return 1
 }
