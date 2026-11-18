@@ -18,11 +18,11 @@ from pathlib import Path
 FFMPEG = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
 
 
-def work_root():
-    root = Path("/mnt/data/rip-work")
+def meta_root():
+    root = Path("/var/lib/rip-bluray")
     try:
         for line in open("/etc/rip-bluray.conf", encoding="utf-8"):
-            if line.startswith("WORK_ROOT="):
+            if line.startswith("META_ROOT="):
                 value = line.split("=", 1)[1].strip()
                 if value:
                     return Path(value)
@@ -32,15 +32,15 @@ def work_root():
 
 
 def index_path():
-    return work_root() / "state/imdb/titles.json"
+    return meta_root() / "state/imdb/titles.json"
 
 
 def cache_dir():
-    return work_root() / "state/identify-cache"
+    return meta_root() / "state/identify-cache"
 
 
 def work_dir():
-    return work_root() / "state/identify-work"
+    return meta_root() / "state/identify-work"
 _INDEX = None
 _WORDS = None
 STUDIO = {
@@ -274,6 +274,7 @@ def docker(image, entrypoint, script, args, timeout):
         "docker", "run", "--rm", "-i",
         "--user", f"{os.getuid()}:{os.getgid()}",
         "-v", "/mnt/data:/mnt/data",
+        "-v", f"{meta_root()}:{meta_root()}",
         "--entrypoint", entrypoint,
         image,
         "-s",

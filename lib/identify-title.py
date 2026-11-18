@@ -20,16 +20,30 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-STATE = Path("/mnt/data/rip-work/state")
+def conf_root(key, default):
+    """A path from /etc/rip-bluray.conf, or the built-in default."""
+    try:
+        for line in open("/etc/rip-bluray.conf", encoding="utf-8"):
+            if line.startswith(key + "="):
+                value = line.split("=", 1)[1].strip()
+                if value:
+                    return Path(value)
+    except OSError:
+        pass
+    return Path(default)
+
+
+META = conf_root("META_ROOT", "/var/lib/rip-bluray")
+STATE = META / "state"
 CACHE = STATE / "identify-cache"
 WORK = STATE / "identify-work"
-LOG_PATH = Path("/mnt/data/rip-work/logs/identify.log")
+LOG_PATH = META / "logs/identify.log"
 IDENTIFIED = STATE / "identified-names"
 NAMES_PATH = STATE / "disc-names"
 QUALITY_PATH = STATE / "encode-quality"
 RENAME_LOG = STATE / "rename-log"
 REVIEW_PATH = STATE / "identify-review"
-JOBS = Path("/mnt/data/rip-work/jobs")
+JOBS = conf_root("WORK_ROOT", "/mnt/data/rip-work") / "jobs"
 FFMPEG = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
 FFPROBE = "/usr/lib/jellyfin-ffmpeg/ffprobe"
 IMAGE = "jellyfin/jellyfin"
@@ -53,13 +67,7 @@ SAMPLE_SECONDS = 18
 
 
 def dest_root():
-    try:
-        for line in open("/etc/rip-bluray.conf", encoding="utf-8"):
-            if line.startswith("DEST_ROOT="):
-                return Path(line.split("=", 1)[1].strip() or "/mnt/data/videos/Movies")
-    except OSError:
-        pass
-    return Path("/mnt/data/videos/Movies")
+    return conf_root("DEST_ROOT", "/mnt/data/videos/Movies")
 
 
 def log(message):
@@ -265,6 +273,7 @@ def docker_sh(script, args, timeout=180):
         "docker", "run", "--rm", "-i",
         "--user", f"{uid}:{gid}",
         "-v", "/mnt/data:/mnt/data",
+        "-v", f"{META}:{META}",
         "--entrypoint", "sh",
         IMAGE,
         "-s",
@@ -965,7 +974,7 @@ def identify(media, hint, refresh_search=False):
 
 
 def output_in_progress(basename):
-    encoder = Path("/mnt/data/rip-work/status/encoder")
+    encoder = META / "status/encoder"
     try:
         text = encoder.read_text(encoding="utf-8")
     except OSError:
@@ -1071,6 +1080,9 @@ def apply_job(job):
         disc_id = (job / "disc-id").read_text(encoding="utf-8").strip()
     except OSError:
         pass
+    if (job / "plan").is_file():
+        log(f"keeping episode {disc_name}")
+        return 0
     if not needs_identify(disc_name):
         log(f"keeping {disc_name}")
         return 0

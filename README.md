@@ -2,7 +2,7 @@
 
 Watch an optical drive, rip a disc, encode it, name it, and serve it.
 
-The ripper and the encoder are separate. A disc can be ripping while an earlier disc is encoding. Finished files go to a Movies folder. Jellyfin serves that folder. A small status page shows what is happening.
+The ripper and the encoder are separate. A disc can be ripping while an earlier disc is encoding. A movie goes to the Movies folder. A disc of episodes goes to the TV Shows folder next to it. Jellyfin serves both. A small status page shows what is happening.
 
 ## Layout
 
@@ -43,7 +43,7 @@ A title printed on screen is tried first. Frames from the start of the file and 
 
 If that finds nothing, and `~/.elevenlabs.key` and `~/.tavily.key` exist, two short dialogue clips are transcribed and searched. Those key files are not part of this repo.
 
-A name learned this way is stored in the work directory, under `state/identified-names`. Putting that disc back in does not create a second copy under the old label.
+A name learned this way is stored on the boot disk, under `META_ROOT/state/identified-names` (`/var/lib/rip-bluray` by default). Putting that disc back in does not create a second copy under the old label. Only the big files — the MKV and MP4 — stay in `WORK_ROOT` on the media disk, so the media disk can idle between rips.
 
 `config/disc-names.example` shows how to force a name for a disc whose label is useless.
 
@@ -57,7 +57,11 @@ A finished file counts as done only if it was encoded with the current setting. 
 
 The status page listens on port 8790. Cron starts it at boot.
 
-Jellyfin listens on port 8096. The Movies folder is mounted read-only. The admin password, if you keep one for the library refresh, goes in `~/jellyfin/admin-password`. Do not commit that file.
+Jellyfin listens on port 8096. Movies and TV Shows are mounted read-only. The admin password, if you keep one for the library refresh, goes in `~/jellyfin/admin-password`. Do not commit that file.
+
+## TV discs
+
+A disc labeled with a season, and a run of titles the same length, is ripped as episodes. The play-all is skipped. `Bluey - Season 1 - First Half` becomes `TV Shows/Bluey (2018)/Season 01/Bluey - S01E01.mp4` and so on, in the order the titles are on the disc. The second half continues that numbering. Putting the disc back in does not create a second copy. The old play-all in Movies is moved aside once the episodes have been ripped.
 
 ## Services
 

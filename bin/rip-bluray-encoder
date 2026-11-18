@@ -100,6 +100,7 @@ encode_job() {
     log "not overwriting $output"
     return 1
   fi
+  mkdir -p "$(dirname "$output")"
   printf '%s\n' encoding > "$job/status"
   partial="$job/encode.mp4"
   rm -f "$partial"
@@ -134,6 +135,9 @@ encode_job() {
   printf '%s\n' done > "$job/status"
   rm -f "$mkv"
   log "done: $output"
+  if [[ -s "$job/plan" ]]; then
+    python3 /usr/local/lib/rip-bluray/choose-title.py --retire-movie "$(cat "$job/plan")" || true
+  fi
   write_status idle "finished $disc_name" "$job"
 }
 

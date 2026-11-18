@@ -2,7 +2,13 @@
 PROFILE=hd
 DEVICE=/dev/sr0
 DEST_ROOT=/mnt/data/videos/Movies
+# Episode discs go here. Leave it unset to use the Movies folder's sibling.
+# SHOWS_ROOT=/mnt/data/videos/TV Shows
 WORK_ROOT=/mnt/data/rip-work
+# Small tracking files (logs, status, locks, state) live on the boot disk so
+# the media disk can idle. Only the big files stay in WORK_ROOT.
+# META_ROOT=/var/lib/rip-bluray
+# RUN_ROOT=/run/rip-bluray
 # A lock older than this, with a dead or silent process, can be taken over.
 LOCK_TIMEOUT=1200
 POLL_SECONDS=15

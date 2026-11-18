@@ -7,7 +7,7 @@ import json
 import re
 from pathlib import Path
 
-ROOT = Path(os.environ.get("RIP_IMDB_DIR", "/mnt/data/rip-work/state/imdb"))
+ROOT = Path(os.environ.get("RIP_IMDB_DIR", "/var/lib/rip-bluray/state/imdb"))
 KEEP = {"movie", "tvMovie", "tvMiniSeries", "tvSpecial", "tvSeries", "video", "tvShort"}
 
 

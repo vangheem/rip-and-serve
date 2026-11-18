@@ -6,6 +6,9 @@ A looping menu is often the longest title and has one chapter. The feature, or
 the play-all on a TV disc, has more chapters. A name file overrides a useless
 volume label. Same-label discs get a unique id so the next disc in a set is
 not skipped.
+
+An episode disc is different. The ripper then reads two lines: "episodes" and
+a plan path. The plan lists each episode title, not the play-all.
 """
 
 import hashlib
@@ -19,13 +22,33 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-NAMES_PATH = Path("/mnt/data/rip-work/state/disc-names")
-IDENTIFIED_PATH = Path("/mnt/data/rip-work/state/identified-names")
-CACHE_PATH = Path("/mnt/data/rip-work/state/title-cache")
-QUALITY_PATH = Path("/mnt/data/rip-work/state/encode-quality")
-PREVIOUS_ENCODE = Path("/mnt/data/rip-work/previous-encode")
-JOBS = Path("/mnt/data/rip-work/jobs")
-LOG_PATH = Path("/mnt/data/rip-work/logs/ripper.log")
+def conf_root(key, default):
+    """A path from /etc/rip-bluray.conf, or the built-in default."""
+    try:
+        for line in open("/etc/rip-bluray.conf", encoding="utf-8"):
+            if line.startswith(key + "="):
+                value = line.split("=", 1)[1].strip()
+                if value:
+                    return Path(value)
+    except OSError:
+        pass
+    return Path(default)
+
+
+META = conf_root("META_ROOT", "/var/lib/rip-bluray")
+STATE = META / "state"
+# The work disk keeps the big files: job scratch and moved-aside movies.
+WORK = conf_root("WORK_ROOT", "/mnt/data/rip-work")
+NAMES_PATH = STATE / "disc-names"
+IDENTIFIED_PATH = STATE / "identified-names"
+CACHE_PATH = STATE / "title-cache"
+QUALITY_PATH = STATE / "encode-quality"
+PREVIOUS_ENCODE = WORK / "previous-encode"
+JOBS = WORK / "jobs"
+LOG_PATH = META / "logs/ripper.log"
+EPISODE_MAP = STATE / "episode-map.json"
+PLAN_DIR = STATE / "plans"
+IMDB_INDEX = STATE / "imdb/titles.json"
 QUALITY_TAG = {
     "dvd": "dvd-x264-rf16-slow",
     "bluray": "bd-x264-rf18-slow",
@@ -217,13 +240,7 @@ def disc_kind(lines):
 
 
 def dest_root():
-    try:
-        for line in open("/etc/rip-bluray.conf", encoding="utf-8"):
-            if line.startswith("DEST_ROOT="):
-                return Path(line.split("=", 1)[1].strip() or "/mnt/data/videos/Movies")
-    except OSError:
-        pass
-    return Path("/mnt/data/videos/Movies")
+    return conf_root("DEST_ROOT", "/mnt/data/videos/Movies")
 
 
 def recorded_quality(basename):
@@ -509,7 +526,7 @@ def glued_title(name):
     if len(words) != 1 or len(words[0]) < 10:
         return ""
     needle = words[0]
-    path = Path("/mnt/data/rip-work/state/imdb/titles.json")
+    path = IMDB_INDEX
     try:
         index = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -646,9 +663,497 @@ def lookup_title(name):
     return pretty
 
 
+HALVES = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5}
+SEASON_LABEL = re.compile(
+    r"^(?P<show>.+?)\s+-\s+Season\s+(?P<season>\d+)"
+    r"(?:\s+-\s+(?:Disc\s+(?P<disc>\d+)|(?P<half>First|Second|Third|Fourth|Fifth)\s+Half))?$",
+    re.I,
+)
+
+
+def shows_root():
+    try:
+        for line in open("/etc/rip-bluray.conf", encoding="utf-8"):
+            if line.startswith("SHOWS_ROOT="):
+                value = line.split("=", 1)[1].strip()
+                if value:
+                    return Path(value)
+    except OSError:
+        pass
+    return dest_root().parent / "TV Shows"
+
+
+def parse_show_label(name):
+    """A season label is a TV disc. 'Show - Disc 2' is a movie set, not one."""
+    match = SEASON_LABEL.match((name or "").strip())
+    if not match:
+        return {"show": name, "season": 1, "part": 1, "season_label": False}
+    half = (match.group("half") or "").lower()
+    disc = match.group("disc")
+    if half:
+        part = HALVES[half]
+    elif disc:
+        part = int(disc)
+    else:
+        part = 1
+    return {
+        "show": match.group("show").strip(),
+        "season": int(match.group("season")),
+        "part": part,
+        "season_label": True,
+    }
+
+
+def select_episodes(rows, season_label):
+    """Episode titles to rip, or None when the disc is a movie.
+
+    A season disc with a run of same-length titles is a TV disc. The play-all
+    is the long title and is not ripped again. A movie set labeled 'Disc 2'
+    does not come through here: that label is not a season label, and a single
+    feature does not form a cluster.
+    """
+    shorts = [row for row in rows if 4 * 60 <= row["sec"] <= 45 * 60]
+    if len(shorts) < 4:
+        return None
+    center = None
+    best_count = 0
+    for row in shorts:
+        count = sum(1 for other in shorts if abs(other["sec"] - row["sec"]) <= 90)
+        if count > best_count:
+            best_count = count
+            center = row["sec"]
+    if center is None:
+        return None
+    cluster = [row for row in shorts if abs(row["sec"] - center) <= 90]
+    if max(row["sec"] for row in cluster) - min(row["sec"] for row in cluster) > 120:
+        return None
+    median = sorted(row["sec"] for row in cluster)[len(cluster) // 2]
+    long_titles = [row for row in rows if row["sec"] >= 50 * 60]
+    # A season label is enough. Without one, the long title has to be the
+    # episodes run together. A movie the same length as its deleted scenes is not.
+    under_hour = [row for row in rows if 3 * 60 <= row["sec"] < 50 * 60]
+    short_sum = sum(row["sec"] for row in under_hour)
+
+    def is_playall(row):
+        if median <= 0 or row["chapters"] < 6:
+            return False
+        if short_sum and abs(row["sec"] - short_sum) <= max(180, short_sum * 0.08):
+            return True
+        multiple = round(row["sec"] / median)
+        if multiple < 6 or multiple > len(cluster):
+            return False
+        expected = multiple * median
+        if abs(row["sec"] - expected) > max(120, expected * 0.08):
+            return False
+        return row["chapters"] >= multiple - 2
+
+    playalls = [row for row in long_titles if is_playall(row)]
+    if season_label and len(cluster) >= 4:
+        pass
+    elif playalls and len(cluster) >= 8:
+        pass
+    else:
+        return None
+    skip = {row["id"] for row in long_titles}
+    chosen = []
+    seen_size = set()
+    for row in sorted(rows, key=lambda item: item["id"]):
+        if row["id"] in skip or row["sec"] < 3 * 60 or row["sec"] >= 50 * 60:
+            continue
+        # Same length and the same number of bytes is the episode listed twice.
+        size = row.get("size") or 0
+        if size:
+            key = (row["sec"], size)
+            if key in seen_size:
+                continue
+            seen_size.add(key)
+        chosen.append(row)
+    if len(chosen) < 4:
+        return None
+    return chosen
+
+
+def series_folder(show):
+    """Bluey (2018) matches the local IMDb list. A miss keeps the disc's name."""
+    key = re.sub(r"[^a-z0-9]+", " ", show.lower()).strip()
+    path = IMDB_INDEX
+    try:
+        index = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return show, None
+    hit = index.get(key) or {}
+    if hit.get("type") not in {"tvSeries", "tvMiniSeries"}:
+        return show, None
+    year = hit.get("year") or None
+    title = clean_name(hit.get("title") or show)
+    if year:
+        return f"{title} ({int(year)})", int(year)
+    return title, None
+
+
+def load_episode_map():
+    try:
+        return json.loads(EPISODE_MAP.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_episode_map(mapping):
+    EPISODE_MAP.parent.mkdir(parents=True, exist_ok=True)
+    temporary = EPISODE_MAP.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(mapping, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(EPISODE_MAP)
+
+
+def episode_key(show, season, part):
+    return f"{show}\t{season}\t{part}"
+
+
+def assign_start(mapping, show, season, part, count, disc_id, folder):
+    """Number this disc's episodes. A later disc waits for the earlier one."""
+    key = episode_key(show, season, part)
+    current = mapping.get(key)
+    if (
+        current
+        and current.get("disc_id") == disc_id
+        and current.get("count") == count
+        and current.get("folder") == folder
+    ):
+        return current["start"], bool(current.get("provisional"))
+    start = 1
+    provisional = False
+    if part > 1:
+        covered = 0
+        for previous in range(1, part):
+            earlier = mapping.get(episode_key(show, season, previous))
+            if not earlier or earlier.get("provisional"):
+                provisional = True
+                break
+            covered = earlier["start"] + earlier["count"] - 1
+        start = part * 1000 + 1 if provisional else covered + 1
+    mapping[key] = {
+        "disc_id": disc_id,
+        "show": show,
+        "folder": folder,
+        "season": season,
+        "part": part,
+        "start": start,
+        "count": count,
+        "provisional": provisional,
+    }
+    return start, provisional
+
+
+def episode_path(folder, show, season, number):
+    code = f"S{season:02d}E{number:02d}"
+    filename = f"{show} - {code}.mp4"
+    directory = shows_root() / folder / f"Season {season:02d}"
+    return directory / filename, code
+
+
+def settle_episode_map(mapping):
+    """Give a later disc real episode numbers once the earlier disc is known."""
+    grouped = {}
+    for row in mapping.values():
+        grouped.setdefault((row["show"], row["season"]), []).append(row)
+    changes = []
+    for rows in grouped.values():
+        known = {row["part"]: row for row in rows if not row.get("provisional")}
+        for row in sorted(rows, key=lambda item: item["part"]):
+            if not row.get("provisional"):
+                continue
+            if not all(part in known for part in range(1, row["part"])):
+                continue
+            start = 1
+            for part in range(1, row["part"]):
+                earlier = known[part]
+                start = earlier["start"] + earlier["count"]
+            if start == row["start"]:
+                row["provisional"] = False
+                known[row["part"]] = row
+                continue
+            changes.append({
+                "show": row["show"],
+                "folder": row["folder"],
+                "season": row["season"],
+                "old_start": row["start"],
+                "new_start": start,
+                "count": row["count"],
+            })
+            row["start"] = start
+            row["provisional"] = False
+            known[row["part"]] = row
+    return changes
+
+
+def apply_episode_renames(changes):
+    """Rename files the encoder already finished. Leave one it is writing."""
+    if not changes:
+        return 0
+    quality = {}
+    try:
+        for line in QUALITY_PATH.read_text(encoding="utf-8").splitlines():
+            name, sep, tag = line.partition(" = ")
+            if sep and name:
+                quality[name] = tag.strip()
+    except OSError:
+        pass
+    renamed = 0
+    for change in changes:
+        for offset in range(change["count"]):
+            old_path, old_code = episode_path(
+                change["folder"], change["show"], change["season"], change["old_start"] + offset
+            )
+            new_path, new_code = episode_path(
+                change["folder"], change["show"], change["season"], change["new_start"] + offset
+            )
+            if old_path == new_path:
+                continue
+            if output_in_progress(old_path.name) or output_in_progress(new_path.name):
+                note(f"leaving {old_path.name}; a job is still using it")
+                continue
+            if old_path.is_file():
+                if new_path.exists():
+                    note(f"not renaming {old_path.name}; {new_path.name} already exists")
+                    continue
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                old_path.rename(new_path)
+                renamed += 1
+                note(f"renamed {old_path.name} to {new_path.name}")
+            if old_path.name in quality:
+                quality[new_path.name] = quality.pop(old_path.name)
+            rewrite_job_output(old_path, new_path, old_code, new_code)
+    if quality:
+        lines = [f"{name} = {quality[name]}" for name in sorted(quality)]
+        try:
+            QUALITY_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+    return renamed
+
+
+def rewrite_job_output(old_path, new_path, old_code, new_code):
+    if not JOBS.is_dir():
+        return
+    old_text = str(old_path)
+    for directory in JOBS.iterdir():
+        output_path = directory / "output"
+        try:
+            current = output_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if current != old_text:
+            continue
+        output_path.write_text(str(new_path) + "\n", encoding="utf-8")
+        name_path = directory / "disc-name"
+        try:
+            name = name_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            name = ""
+        if name.endswith(old_code):
+            name_path.write_text(name[: -len(old_code)] + new_code + "\n", encoding="utf-8")
+
+
+def settle_episodes():
+    mapping = load_episode_map()
+    changes = settle_episode_map(mapping)
+    if not changes:
+        return 0
+    save_episode_map(mapping)
+    renamed = apply_episode_renames(changes)
+    note(f"settled episode numbers; renamed {renamed} files")
+    return renamed
+
+
+def move_aside(path):
+    """Keep a replaced file. The movie library must not keep the play-all."""
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    if output_in_progress(path.name):
+        note(f"leaving {path.name} in place; a job is already using it")
+        return False
+    PREVIOUS_ENCODE.mkdir(parents=True, exist_ok=True)
+    backup = PREVIOUS_ENCODE / path.name
+    if backup.exists():
+        backup = PREVIOUS_ENCODE / f"{path.stem}-{int(path.stat().st_mtime)}{path.suffix}"
+    path.rename(backup)
+    note(f"moved {path.name} aside")
+    return True
+
+
+def build_episode_plan(rows, parsed, disc_name, disc_id, kind):
+    folder, _year = series_folder(parsed["show"])
+    show = re.sub(r"\s+\(\d{4}\)$", "", folder)
+    mapping = load_episode_map()
+    start, provisional = assign_start(
+        mapping, show, parsed["season"], parsed["part"], len(rows), disc_id, folder
+    )
+    save_episode_map(mapping)
+    settle_episodes()
+    mapping = load_episode_map()
+    saved = mapping.get(episode_key(show, parsed["season"], parsed["part"])) or {}
+    start = saved.get("start", start)
+    provisional = bool(saved.get("provisional", provisional))
+    episodes = []
+    for offset, row in enumerate(rows):
+        path, code = episode_path(folder, show, parsed["season"], start + offset)
+        episodes.append({
+            "title_id": row["id"],
+            "code": code,
+            "name": f"{show} - {code}",
+            "duration": row["duration"],
+            "output": str(path),
+        })
+    plan = {
+        "disc_name": disc_name,
+        "disc_id": disc_id,
+        "show": show,
+        "folder": folder,
+        "season": parsed["season"],
+        "part": parsed["part"],
+        "kind": kind,
+        "provisional": provisional,
+        "episodes": episodes,
+    }
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", disc_id).strip("-") or "disc"
+    PLAN_DIR.mkdir(parents=True, exist_ok=True)
+    path = PLAN_DIR / f"{safe}.json"
+    path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    note(
+        f"episode disc {disc_name}: {len(episodes)} episodes"
+        + (" (numbering waits for the earlier disc)" if provisional else "")
+    )
+    return path
+
+
+def emit_pending(plan_path):
+    plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    kind = plan.get("kind") or "dvd"
+    expected = QUALITY_TAG.get(kind) or QUALITY_TAG["dvd"]
+    for episode in plan["episodes"]:
+        output = Path(episode["output"])
+        if output.is_file() and output.stat().st_size == 0:
+            output.unlink()
+        if output.is_file() and output.stat().st_size > 0:
+            current = recorded_quality(output.name)
+            if current == expected or output_in_progress(output.name):
+                continue
+            if current != expected:
+                move_aside(output)
+        elif output_in_progress(output.name):
+            continue
+        print(
+            f"{episode['title_id']}\t{episode['name']}\t{episode['output']}\t{episode['duration']}"
+        )
+
+
+def retire_playall(plan_path):
+    """Move the old play-all aside only after every episode file exists."""
+    plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    for episode in plan["episodes"]:
+        output = Path(episode["output"])
+        if not output.is_file() or output.stat().st_size == 0:
+            return
+    movie = dest_root() / f"{plan['disc_name']}.mp4"
+    if movie.is_file():
+        move_aside(movie)
+
+
+def self_test():
+    def row(title_id, seconds, chapters=2, size=0):
+        hours, rest = divmod(seconds, 3600)
+        minutes, secs = divmod(rest, 60)
+        return {
+            "id": title_id,
+            "sec": seconds,
+            "chapters": chapters,
+            "size": size,
+            "duration": f"{hours}:{minutes:02d}:{secs:02d}",
+        }
+
+    def bluey(play_seconds, play_chapters, shorts, specials=()):
+        rows = [row(0, play_seconds, play_chapters)]
+        title_id = 1
+        for seconds in shorts:
+            rows.append(row(title_id, seconds, 2, size=title_id * 1000))
+            title_id += 1
+        for seconds in specials:
+            rows.append(row(title_id, seconds, 2, size=title_id * 1000))
+            title_id += 1
+        return rows
+
+    parsed = parse_show_label("Bluey - Season 1 - First Half")
+    assert parsed == {"show": "Bluey", "season": 1, "part": 1, "season_label": True}
+    assert parse_show_label("Bluey - Season 2 - Second Half")["part"] == 2
+    assert parse_show_label("Gettysburg (1993) - Disc 2")["season_label"] is False
+
+    first = select_episodes(bluey(3 * 3600 + 2 * 60 + 42, 27, [7 * 60 + 2] * 25 + [6 * 60 + 52]), True)
+    assert first is not None and len(first) == 26 and all(item["sec"] < 50 * 60 for item in first)
+    second_half = select_episodes(
+        bluey(2 * 3600 + 48 * 60 + 40, 24, [7 * 60 + 20] * 30), True
+    )
+    assert second_half is not None and len(second_half) == 30
+    specials = select_episodes(
+        bluey(
+            3 * 3600 + 19 * 60 + 55,
+            30,
+            [7 * 60 + 20] * 21 + [8 * 60 + 23, 7 * 60 + 51],
+            specials=(29 * 60 + 41,),
+        ),
+        True,
+    )
+    assert specials is not None and len(specials) == 24
+    bumpers = select_episodes(
+        bluey(3 * 3600 + 25 * 60 + 51, 29, [7 * 60 + 20] * 27 + [7 * 60 + 51])
+        + [row(80, 2 * 60 + 17, 1), row(81, 2 * 60 + 33, 1)],
+        True,
+    )
+    assert bumpers is not None and all(item["sec"] >= 3 * 60 for item in bumpers)
+    movie = [row(0, 106 * 60, 16, 50)] + [row(index, 8 * 60, 1, index) for index in range(1, 4)]
+    assert select_episodes(movie, False) is None
+    assert select_episodes(movie, True) is None
+    extras = [row(0, 90 * 60, 18, 90)] + [row(index, 8 * 60, 1, index) for index in range(1, 11)]
+    assert select_episodes(extras, False) is None
+
+    mapping = {}
+    start, provisional = assign_start(mapping, "Bluey", 1, 1, 26, "disc-a", "Bluey (2018)")
+    assert (start, provisional) == (1, False)
+    start, provisional = assign_start(mapping, "Bluey", 1, 2, 26, "disc-b", "Bluey (2018)")
+    assert (start, provisional) == (27, False)
+    later = {}
+    start, provisional = assign_start(later, "Bluey", 1, 2, 26, "disc-b", "Bluey (2018)")
+    assert (start, provisional) == (2001, True)
+    assign_start(later, "Bluey", 1, 1, 26, "disc-a", "Bluey (2018)")
+    changes = settle_episode_map(later)
+    assert changes and changes[0]["old_start"] == 2001 and changes[0]["new_start"] == 27
+    assert later[episode_key("Bluey", 1, 2)]["provisional"] is False
+    print("ok")
+    return 0
+
+
 def main():
-    lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
-    Path("/mnt/data/rip-work/state/last-info.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    args = sys.argv[1:]
+    if args[:1] == ["--self-test"]:
+        raise SystemExit(self_test())
+    if args[:1] == ["--plan-field"] and len(args) == 3:
+        plan = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+        value = plan.get(args[1], "")
+        print(value)
+        return
+    if args[:1] == ["--pending"] and len(args) == 2:
+        emit_pending(args[1])
+        return
+    if args[:1] == ["--retire-movie"] and len(args) == 2:
+        retire_playall(args[1])
+        return
+    if args[:1] == ["--settle"]:
+        settle_episodes()
+        return
+    if not args:
+        raise SystemExit("usage: choose-title.py INFO")
+    lines = open(args[0], encoding="utf-8", errors="replace").read().splitlines()
+    (STATE / "last-info.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     hidden = navigation_titles(lines)
     if hidden:
         note("scan hid " + ", ".join(f"title {item["id"]} ({item["duration"]})" for item in hidden))
@@ -679,6 +1184,22 @@ def main():
                 audio_counts[int(match.group(1))] = audio_counts.get(int(match.group(1)), 0) + 1
     if not disc:
         raise SystemExit("no disc name")
+    raw_name = clean_name(disc)
+    parsed = parse_show_label(raw_name)
+    episode_rows = select_episodes(title_rows(titles, audio_counts), parsed["season_label"])
+    if episode_rows:
+        label = disc_id or raw_name
+        fingerprint = disc_fingerprint(device_path())
+        _by_fingerprint, _by_duration, by_series, _by_label = load_rules()
+        shared = catalog_code(label) or label in by_series
+        if shared and (fingerprint or episode_rows[0]["duration"]):
+            identity = f"{label}-{fingerprint or episode_rows[0]['duration']}"
+        else:
+            identity = label
+        plan = build_episode_plan(episode_rows, parsed, raw_name, identity, disc_kind(lines))
+        print("episodes")
+        print(plan)
+        return
     chosen_title = choose_feature(titles, audio_counts, lines)
     if chosen_title is None:
         raise SystemExit("no titles")

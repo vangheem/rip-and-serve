@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Watch the optical drive, rip the longest title, then eject the disc.
+# Watch the optical drive. Rip the movie, or each episode on a TV disc, then eject.
 set -euo pipefail
 
 ROLE=ripper
@@ -93,9 +93,92 @@ eject_disc() {
   write_status idle "ejected $name; waiting for the next disc"
 }
 
+CHOOSE=/usr/local/lib/rip-bluray/choose-title.py
+
+save_title() {
+  local job="$1" title_id="$2" label="$3"
+  LAST_PROGRESS=""
+  if ! run_with_progress_timeout "$job" \
+    makemkvcon --progress=-stdout --cache="$CACHE" mkv "dev:$DEVICE" "$title_id" "$job"; then
+    printf '%s\n' failed > "$job/status"
+    printf '%s\n' "MakeMKV failed or stalled" > "$job/error"
+    log "rip failed for $label; disc left in the drive"
+    write_status failed "rip failed for $label" "$job"
+    return 1
+  fi
+  # makemkvcon writes its own log redirection only if we wrap it.
+  # run_with_progress_timeout does not redirect, so send output in the wrapper.
+  local mkv
+  mkv="$(find "$job" -type f -name '*.mkv' -printf '%s\t%p\n' | sort -nr | head -1 | cut -f2- || true)"
+  if [[ -z "$mkv" ]]; then
+    printf '%s\n' failed > "$job/status"
+    printf '%s\n' "MakeMKV produced no MKV" > "$job/error"
+    log "rip produced no MKV for $label"
+    write_status failed "no MKV for $label" "$job"
+    return 1
+  fi
+  printf '%s\n' "$mkv" > "$job/mkv"
+  printf '%s\n' ripped > "$job/status"
+  log "rip complete: $mkv"
+}
+
+rip_episode_disc() {
+  local plan="$1"
+  local disc_name disc_id pending line title_id episode_name output duration
+  local stamp slug job count
+  disc_name="$(python3 "$CHOOSE" --plan-field disc_name "$plan")"
+  disc_id="$(python3 "$CHOOSE" --plan-field disc_id "$plan")"
+  if [[ -f "$STATE_DIR/hold-disc-id" && "$(cat "$STATE_DIR/hold-disc-id")" == "$disc_id" ]]; then
+    write_status idle "$disc_name is done; remove the disc when you want the next one"
+    return 0
+  fi
+  pending="$(mktemp)"
+  if ! python3 "$CHOOSE" --pending "$plan" >"$pending"; then
+    log "could not read the episode plan for $disc_name"
+    rm -f "$pending"
+    return 1
+  fi
+  count="$(grep -c . "$pending" || true)"
+  if [[ "$count" -eq 0 ]]; then
+    rm -f "$pending"
+    python3 "$CHOOSE" --retire-movie "$plan" || true
+    log "$disc_name episodes already exist; ejecting without a new rip"
+    printf '%s\n' "$disc_id" > "$STATE_DIR/hold-disc-id"
+    eject_disc "$disc_name"
+    return 0
+  fi
+  log "ripping $count episodes from $disc_name"
+  while IFS=$'\t' read -r title_id episode_name output duration; do
+    [[ -n "${title_id:-}" ]] || continue
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    slug="$(printf '%s' "$episode_name" | tr -c 'A-Za-z0-9._-' '-')"
+    job="$JOBS/${stamp}-${slug}"
+    mkdir -p "$job" "$(dirname "$output")"
+    printf '%s\n' ripping > "$job/status"
+    printf '%s\n' "$episode_name" > "$job/disc-name"
+    printf '%s\n' "${disc_id}#${episode_name}" > "$job/disc-id"
+    printf '%s\n' "$title_id" > "$job/title-id"
+    printf '%s\n' "$PROFILE" > "$job/profile"
+    printf '%s\n' "$output" > "$job/output"
+    printf '%s\n' "$plan" > "$job/plan"
+    log "ripping $episode_name title $title_id ($duration) to $job"
+    write_status ripping "ripping $episode_name" "$job"
+    if ! save_title "$job" "$title_id" "$episode_name"; then
+      rm -f "$pending"
+      return 1
+    fi
+  done <"$pending"
+  rm -f "$pending"
+  python3 "$CHOOSE" --retire-movie "$plan" || true
+  python3 "$CHOOSE" --settle || true
+  printf '%s\n' "$disc_id" > "$STATE_DIR/hold-disc-id"
+  log "episode rip complete: $disc_name"
+  eject_disc "$disc_name"
+}
+
 rip_current_disc() {
   local info choice title_id disc_name disc_id duration
-  local stamp slug job output mkv
+  local stamp slug job output plan
   info="$(mktemp)"
   choice="$(mktemp)"
   if ! read_disc "$info"; then
@@ -103,10 +186,16 @@ rip_current_disc() {
     rm -f "$info" "$choice"
     return 1
   fi
-  if ! python3 /usr/local/lib/rip-bluray/choose-title.py "$info" >"$choice"; then
+  if ! python3 "$CHOOSE" "$info" >"$choice"; then
     log "could not choose a title"
     rm -f "$info" "$choice"
     return 1
+  fi
+  if [[ "$(sed -n '1p' "$choice")" == "episodes" ]]; then
+    plan="$(sed -n '2p' "$choice")"
+    rm -f "$info" "$choice"
+    rip_episode_disc "$plan" || return 1
+    return 0
   fi
   title_id="$(sed -n '1p' "$choice")"
   disc_name="$(sed -n '2p' "$choice")"
@@ -140,29 +229,10 @@ rip_current_disc() {
   log "ripping $disc_name title $title_id ($duration) to $job"
   write_status ripping "ripping $disc_name" "$job"
 
-  LAST_PROGRESS=""
-  if ! run_with_progress_timeout "$job" \
-    makemkvcon --progress=-stdout --cache="$CACHE" mkv "dev:$DEVICE" "$title_id" "$job"; then
-    printf '%s\n' failed > "$job/status"
-    printf '%s\n' "MakeMKV failed or stalled" > "$job/error"
-    log "rip failed for $disc_name; disc left in the drive"
-    write_status failed "rip failed for $disc_name" "$job"
+  if ! save_title "$job" "$title_id" "$disc_name"; then
     return 1
   fi
-  # makemkvcon writes its own log redirection only if we wrap it.
-  # run_with_progress_timeout does not redirect, so send output in the wrapper.
-  mkv="$(find "$job" -type f -name '*.mkv' -printf '%s\t%p\n' | sort -nr | head -1 | cut -f2- || true)"
-  if [[ -z "$mkv" ]]; then
-    printf '%s\n' failed > "$job/status"
-    printf '%s\n' "MakeMKV produced no MKV" > "$job/error"
-    log "rip produced no MKV for $disc_name"
-    write_status failed "no MKV for $disc_name" "$job"
-    return 1
-  fi
-  printf '%s\n' "$mkv" > "$job/mkv"
-  printf '%s\n' ripped > "$job/status"
   printf '%s\n' "$disc_id" > "$STATE_DIR/hold-disc-id"
-  log "rip complete: $mkv"
   eject_disc "$disc_name"
 }
 

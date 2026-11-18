@@ -16,10 +16,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 WORK = Path(os.environ.get("RIP_WORK", "/mnt/data/rip-work"))
+META = Path(os.environ.get("RIP_META", "/var/lib/rip-bluray"))
 DEVICE = os.environ.get("RIP_DEVICE", "/dev/sr0")
 JOBS = WORK / "jobs"
-LOGS = WORK / "logs"
-STATUS = WORK / "status"
+LOGS = META / "logs"
+STATUS = META / "status"
+STATE = META / "state"
 UNITS = ("rip-bluray-ripper", "rip-bluray-encoder")
 ROLES = ("ripper", "encoder")
 
@@ -763,11 +765,11 @@ def advice_for(reason):
 
 
 def hold_id():
-    return read_text(WORK / "state" / "hold-disc-id").strip()
+    return read_text(STATE / "hold-disc-id").strip()
 
 
 def release_hold(name):
-    hold_path = WORK / "state" / "hold-disc-id"
+    hold_path = STATE / "hold-disc-id"
     hold = read_text(hold_path).strip()
     if not name or not hold:
         return False
@@ -786,7 +788,7 @@ def release_hold(name):
         return False
     for extra in ("rip-fail-count", "rip-fail-name"):
         try:
-            (WORK / "state" / extra).unlink()
+            (STATE / extra).unlink()
         except OSError:
             pass
     return True
@@ -801,7 +803,7 @@ def dest_root():
 
 def seated_long_enough(drive, ripper, now, seconds=180):
     """A new disc needs time to spin up. Do not call that a failure."""
-    path = WORK / "state" / "seated-since"
+    path = STATE / "seated-since"
     if drive.get("status") != "DISC_OK" or ripper.get("state") not in {"idle", "failed", "unknown"}:
         try:
             path.unlink()

@@ -7,7 +7,10 @@ load_config() {
   PROFILE=hd
   DEVICE=/dev/sr0
   DEST_ROOT=/mnt/data/videos/Movies
+  SHOWS_ROOT="/mnt/data/videos/TV Shows"
   WORK_ROOT=/mnt/data/rip-work
+  META_ROOT=/var/lib/rip-bluray
+  RUN_ROOT=/run/rip-bluray
   LOCK_TIMEOUT=1200
   POLL_SECONDS=15
   CACHE=512
@@ -16,12 +19,18 @@ load_config() {
     # shellcheck disable=SC1090
     source "$RIP_CONF"
   fi
+  # Only the big files (MKV, ISO, MP4) stay on the media disk. The small
+  # tracking files live on the boot disk so the media disk can idle.
+  # Locks are volatile; they never need to survive a reboot.
   JOBS="$WORK_ROOT/jobs"
-  LOCKS="$WORK_ROOT/locks"
-  LOG_DIR="$WORK_ROOT/logs"
-  STATUS_DIR="$WORK_ROOT/status"
-  STATE_DIR="$WORK_ROOT/state"
-  mkdir -p "$JOBS" "$LOCKS" "$LOG_DIR" "$STATUS_DIR" "$STATE_DIR" "$DEST_ROOT"
+  LOCKS="$RUN_ROOT/locks"
+  LOG_DIR="$META_ROOT/logs"
+  STATUS_DIR="$META_ROOT/status"
+  STATE_DIR="$META_ROOT/state"
+  if [[ -z "${SHOWS_ROOT:-}" ]]; then
+    SHOWS_ROOT="$(dirname "$DEST_ROOT")/TV Shows"
+  fi
+  mkdir -p "$JOBS" "$LOCKS" "$LOG_DIR" "$STATUS_DIR" "$STATE_DIR" "$DEST_ROOT" "$SHOWS_ROOT"
   # A scratched disc can knock the drive off USB. It comes back as another device.
   if [[ ! -b "${DEVICE:-}" ]]; then
     local candidate
@@ -122,7 +131,14 @@ write_status() {
     message="copying around the scratch"
     job="$(cat "$STATE_DIR/scratch-copy")"
   fi
-  cat > "$STATUS_DIR/$ROLE" <<EOF
+  # An idle poll rewrites the same status. Skip it; the disk stays quiet.
+  local file="$STATUS_DIR/$ROLE"
+  local next
+  next="$(printf 'state=%s\njob=%s\nmessage=%s' "$state" "$job" "$message")"
+  if [[ -f "$file" ]] && [[ "$(grep -E '^(state|job|message)=' "$file" 2>/dev/null)" == "$next" ]]; then
+    return 0
+  fi
+  cat > "$file" <<EOF
 state=$state
 job=$job
 updated=$(date -Is)
@@ -312,13 +328,13 @@ record_finished_quality() {
   local output="$1" tag
   tag="$(cat "$STATE_DIR/last-encode-tag" 2>/dev/null || true)"
   [[ -n "$tag" && -n "$output" ]] || return 0
-  python3 - "$output" "$tag" << 'PY'
+  python3 - "$output" "$tag" "$STATE_DIR" "$WORK_ROOT" << 'PY'
 import sys
 from pathlib import Path
-output, tag = sys.argv[1], sys.argv[2]
+output, tag, state_dir, work_root = sys.argv[1:]
 base = Path(output).name
-ledger = Path("/mnt/data/rip-work/state/encode-quality")
-previous = Path("/mnt/data/rip-work/previous-encode") / base
+ledger = Path(state_dir) / "encode-quality"
+previous = Path(work_root) / "previous-encode" / base
 lines = []
 if ledger.exists():
     for line in ledger.read_text(encoding="utf-8").splitlines():

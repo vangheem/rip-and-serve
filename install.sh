@@ -31,6 +31,7 @@ link_file() {
 load_dest() {
   DEST_ROOT=/mnt/data/videos/Movies
   WORK_ROOT=/mnt/data/rip-work
+  META_ROOT=/var/lib/rip-bluray
   if [[ -f "$CONF" ]]; then
     # shellcheck disable=SC1090
     source "$CONF"
@@ -109,7 +110,7 @@ write_compose() {
   gid="$(id -g)"
   video="$(group_id video || true)"
   render="$(group_id render || true)"
-  jellyfin_root="${JELLYFIN_ROOT:-/mnt/data/jellyfin}"
+  jellyfin_root="${JELLYFIN_ROOT:-/var/lib/jellyfin}"
   movies="$DEST_ROOT"
   {
     echo "services:"
@@ -132,6 +133,10 @@ write_compose() {
     echo "        source: ${movies}"
     echo "        target: /media"
     echo "        read_only: true"
+    echo "      - type: bind"
+    echo "        source: \"$(dirname "$movies")/TV Shows\""
+    echo "        target: /tv"
+    echo "        read_only: true"
     if [[ -e /dev/dri ]]; then
       echo "    devices:"
       echo "      - /dev/dri:/dev/dri"
@@ -145,7 +150,13 @@ install_jellyfin() {
     log "docker is not installed; Jellyfin was not started"
     return 0
   fi
-  mkdir -p "$HOME_DIR/jellyfin" "${JELLYFIN_ROOT:-/mnt/data/jellyfin}/config" "${JELLYFIN_ROOT:-/mnt/data/jellyfin}/cache" "$DEST_ROOT"
+  mkdir -p "$DEST_ROOT" "$(dirname "$DEST_ROOT")/TV Shows"
+  local root="${JELLYFIN_ROOT:-/var/lib/jellyfin}"
+  if ! mkdir -p "$root/config" "$root/cache" 2>/dev/null; then
+    log "cannot create $root; run: sudo mkdir -p $root && sudo chown $USER_NAME $root"
+    return 0
+  fi
+  mkdir -p "$HOME_DIR/jellyfin"
   local generated="$HOME_DIR/jellyfin/docker-compose.yml.new"
   local live="$HOME_DIR/jellyfin/docker-compose.yml"
   write_compose "$generated"
@@ -160,6 +171,87 @@ install_jellyfin() {
     log "set a Jellyfin password in $HOME_DIR/jellyfin/admin-password after the first login"
   fi
   docker compose -f "$live" up -d
+  ensure_tv_library
+}
+
+ensure_tv_library() {
+  local password
+  password="$HOME_DIR/jellyfin/admin-password"
+  if [[ ! -f "$password" ]]; then
+    log "jellyfin password file missing; TV library was not added"
+    return 0
+  fi
+  python3 - "$password" "$USER_NAME" << 'PY'
+import json
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+password_path, user = sys.argv[1:]
+password = open(password_path, encoding="utf-8").read().strip()
+header = 'MediaBrowser Client="rip", Device="rip", DeviceId="rip-tv", Version="1.0"'
+
+def call(url, payload=None, method=None, token=""):
+    data = None if payload is None else json.dumps(payload).encode()
+    if method == "POST" and data is None:
+        data = b""
+    headers = {
+        "Authorization": header + (f', Token="{token}"' if token else ""),
+        "Accept": "application/json",
+    }
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = response.read().decode("utf-8", "replace")
+            return json.loads(body) if body else None
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        if exc.code in {200, 204}:
+            return None
+        raise SystemExit(f"jellyfin HTTP {exc.code}: {detail}")
+
+auth = call(
+    "http://127.0.0.1:8096/Users/AuthenticateByName",
+    {"Username": user, "Pw": password},
+    "POST",
+)
+token = (auth or {}).get("AccessToken") or ""
+if not token:
+    raise SystemExit("jellyfin did not return a token")
+folders = call("http://127.0.0.1:8096/Library/VirtualFolders", token=token) or []
+if isinstance(folders, dict):
+    folders = folders.get("Items") or folders.get("VirtualFolders") or []
+for folder in folders:
+    if (folder.get("CollectionType") or "") == "tvshows":
+        print("tv library already present")
+        raise SystemExit(0)
+query = urllib.parse.urlencode({
+    "name": "TV Shows",
+    "collectionType": "tvshows",
+    "paths": "/tv",
+    "refreshLibrary": "true",
+})
+call(
+    "http://127.0.0.1:8096/Library/VirtualFolders?" + query,
+    {
+        "LibraryOptions": {
+            "Enabled": True,
+            "EnableRealtimeMonitor": True,
+            "EnableInternetProviders": True,
+            "EnableAutomaticSeriesGrouping": True,
+            "PreferredMetadataLanguage": "en",
+            "MetadataCountryCode": "US",
+            "SeasonZeroDisplayName": "Specials",
+        }
+    },
+    "POST",
+    token,
+)
+print("added TV Shows library")
+PY
 }
 
 ensure_skip_read_errors() {
@@ -177,7 +269,7 @@ ensure_skip_read_errors() {
 }
 
 install_titles() {
-  local state="$WORK_ROOT/state/imdb"
+  local state="$META_ROOT/state/imdb"
   mkdir -p "$state"
   local basics="$state/title.basics.tsv.gz"
   local ratings="$state/title.ratings.tsv.gz"
@@ -213,6 +305,11 @@ install_units() {
     if [[ ! -f "$CONF" ]]; then
       sudo install -m 644 "$ROOT/config/rip-bluray.conf.example" "$CONF"
     fi
+    if [[ ! -f /etc/tmpfiles.d/rip-bluray.conf ]]; then
+      printf 'd /run/rip-bluray 0755 %s %s -\n' "$USER_NAME" "$(id -gn "$USER_NAME")" | sudo tee /etc/tmpfiles.d/rip-bluray.conf >/dev/null
+      log "wrote /etc/tmpfiles.d/rip-bluray.conf"
+    fi
+    sudo systemd-tmpfiles --create /etc/tmpfiles.d/rip-bluray.conf
     sudo systemctl daemon-reload
     sudo systemctl enable rip-bluray-ripper.service rip-bluray-encoder.service
   else
@@ -222,7 +319,7 @@ install_units() {
 
 reload_idle_ripper() {
   local status pid
-  status="$WORK_ROOT/status/ripper"
+  status="$META_ROOT/status/ripper"
   [[ -f "$status" ]] || return 0
   if [[ "$(sed -n 's/^state=//p' "$status")" != "idle" ]]; then
     log "ripper is busy; it will read the repo copy the next time it starts"
